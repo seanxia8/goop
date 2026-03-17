@@ -1,0 +1,6 @@
+[submodule "jaxtpc"]
+	path = jaxtpc
+	url = https://github.com/omaralterkait/jaxtpc
+[submodule "waveforms"]
+	path = waveforms
+	url = https://github.com/carsmithhhh/waveforms.git
