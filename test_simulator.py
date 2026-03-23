@@ -4,7 +4,9 @@ import pytest
 import torch
 
 from goop import (
+    DarkNoise,
     Delays,
+    DigitizationConfig,
     OpticalSimConfig,
     OpticalSimulator,
     RLCKernel,
@@ -15,6 +17,7 @@ from goop import (
     Waveform,
     create_default_delays,
 )
+from goop.digitize import digitize
 
 DEVICE = torch.device("cpu")
 
@@ -619,3 +622,215 @@ class TestDifferentTickNs:
         )
 
 
+# ---------------------------------------------------------------------------
+# Digitization tests
+# ---------------------------------------------------------------------------
+
+class TestDigitize:
+    def test_pedestal_added(self):
+        data = torch.zeros(2, 10)
+        result = digitize(data, pedestal=100.0, n_bits=14)
+        assert (result == 100.0).all()
+
+    def test_quantization(self):
+        data = torch.tensor([0.3, 0.7, 1.5, 2.5])
+        result = digitize(data, pedestal=0.0, n_bits=14)
+        # torch.round uses banker's rounding: 0.5 -> 0, 1.5 -> 2, 2.5 -> 2
+        assert result[0].item() == 0.0
+        assert result[1].item() == 1.0
+
+    def test_saturation_upper(self):
+        data = torch.tensor([20000.0])
+        result = digitize(data, pedestal=0.0, n_bits=14)
+        assert result.item() == 16383.0
+
+    def test_saturation_lower(self):
+        data = torch.tensor([-5000.0])
+        result = digitize(data, pedestal=100.0, n_bits=14)
+        assert result.item() == 0.0
+
+    def test_14bit_range(self):
+        data = torch.linspace(-2000, 20000, 1000)
+        result = digitize(data, pedestal=1500.0, n_bits=14)
+        assert result.min().item() >= 0
+        assert result.max().item() <= 16383
+
+    def test_10bit_range(self):
+        data = torch.linspace(-2000, 5000, 1000)
+        result = digitize(data, pedestal=500.0, n_bits=10)
+        assert result.min().item() >= 0
+        assert result.max().item() <= 1023
+
+    def test_all_values_integer(self):
+        data = torch.randn(100) * 500 + 1000
+        result = digitize(data, pedestal=1500.0, n_bits=14)
+        assert torch.equal(result, result.round())
+
+
+class TestWaveformDigitize:
+    def test_waveform_digitize(self):
+        wf = Waveform(
+            data=torch.randn(2, 100) * 100,
+            t0=0.0, tick_ns=1.0, n_channels=2,
+        )
+        digitized = wf.digitize(pedestal=1500.0, n_bits=14)
+        assert isinstance(digitized, Waveform)
+        assert digitized.data.shape == wf.data.shape
+        assert digitized.t0 == wf.t0
+        assert digitized.tick_ns == wf.tick_ns
+        assert digitized.data.min().item() >= 0
+        assert digitized.data.max().item() <= 16383
+
+    def test_sliced_digitize(self):
+        sw = SlicedWaveform(
+            adc=torch.randn(200) * 100,
+            offsets=torch.tensor([0, 100, 200]),
+            t0_ns=torch.tensor([0.0, 500.0]),
+            pmt_id=torch.tensor([0, 1]),
+            tick_ns=1.0, n_channels=2,
+        )
+        digitized = sw.digitize(pedestal=1500.0, n_bits=14)
+        assert isinstance(digitized, SlicedWaveform)
+        assert digitized.adc.shape == sw.adc.shape
+        assert digitized.adc.min().item() >= 0
+        assert digitized.adc.max().item() <= 16383
+        assert torch.equal(digitized.offsets, sw.offsets)
+
+    def test_sliced_digitize_deslice_matches_waveform_digitize(self):
+        torch.manual_seed(55)
+        times = torch.rand(500) * 200.0
+        channels = torch.randint(0, 2, (500,))
+
+        wf = Waveform.from_photons(times, channels, tick_ns=1.0, n_channels=2)
+        kernel = RLCKernel(duration_ns=500.0, device=DEVICE)()
+        convolved = wf.convolve(kernel, gain=-20.0)
+        wf_digitized = convolved.digitize(pedestal=1500.0, n_bits=14)
+
+        sliced = convolved.slice(kernel_extent_ns=500.0)
+        sw_digitized = sliced.digitize(pedestal=1500.0, n_bits=14)
+        recovered = sw_digitized.deslice()
+
+        n_cmp = min(wf_digitized.data.shape[1], recovered.data.shape[1])
+        for ch in range(2):
+            assert torch.equal(
+                wf_digitized.data[ch, :n_cmp], recovered.data[ch, :n_cmp]
+            ), f"ch {ch}: digitized slice->deslice mismatch"
+
+
+# ---------------------------------------------------------------------------
+# Dark noise tests
+# ---------------------------------------------------------------------------
+
+class TestDarkNoise:
+    def test_shape_and_types(self):
+        dn = DarkNoise(rate_hz=2000.0)
+        times, channels = dn.sample(4, 0.0, 1e6, DEVICE)
+        assert times.dim() == 1
+        assert channels.dim() == 1
+        assert times.shape == channels.shape
+
+    def test_time_range(self):
+        torch.manual_seed(0)
+        dn = DarkNoise(rate_hz=100_000.0)  # high rate for statistics
+        times, channels = dn.sample(4, 100.0, 1e6, DEVICE)
+        if times.numel() > 0:
+            assert times.min().item() >= 100.0
+            assert times.max().item() <= 1e6
+
+    def test_channel_range(self):
+        torch.manual_seed(0)
+        dn = DarkNoise(rate_hz=100_000.0)
+        times, channels = dn.sample(4, 0.0, 1e6, DEVICE)
+        if channels.numel() > 0:
+            assert channels.min().item() >= 0
+            assert channels.max().item() < 4
+
+    def test_mean_count(self):
+        torch.manual_seed(0)
+        dn = DarkNoise(rate_hz=1000.0)
+        # 1 ms window, 4 channels, 1 kHz rate → expect ~1 hit per channel, ~4 total
+        counts = []
+        for _ in range(1000):
+            t, c = dn.sample(4, 0.0, 1e6, DEVICE)  # 1e6 ns = 1 ms
+            counts.append(t.numel())
+        mean_count = sum(counts) / len(counts)
+        # expected: 4 channels * 1000 Hz * 1e-3 s = 4.0
+        assert abs(mean_count - 4.0) < 1.0, f"mean dark hits {mean_count}, expected ~4"
+
+    def test_zero_rate_empty(self):
+        dn = DarkNoise(rate_hz=0.0)
+        times, channels = dn.sample(4, 0.0, 1e6, DEVICE)
+        assert times.numel() == 0
+        assert channels.numel() == 0
+
+    def test_zero_window_empty(self):
+        dn = DarkNoise(rate_hz=2000.0)
+        times, channels = dn.sample(4, 100.0, 100.0, DEVICE)
+        assert times.numel() == 0
+
+
+# ---------------------------------------------------------------------------
+# Integration: digitization + dark noise in pipeline
+# ---------------------------------------------------------------------------
+
+class TestPipelineDigitization:
+    def test_backward_compat(self):
+        """No digitization or aux sources → identical to original behavior."""
+        sim = _make_simulator()
+        pos = torch.zeros(10, 3)
+        n_ph = torch.full((10,), 100)
+        t = torch.zeros(10)
+        result = sim.simulate(pos, n_ph, t, stitched=True)
+        assert isinstance(result, SlicedWaveform)
+        # Output should be float, not quantized
+        assert result.adc.dtype == torch.float32
+
+    def test_digitization_produces_integers(self):
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=2000.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-45.0,
+            digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=False,
+        )
+        assert isinstance(result, Waveform)
+        assert torch.equal(result.data, result.data.round())
+        assert result.data.min().item() >= 0
+        assert result.data.max().item() <= 16383
+
+    def test_dark_noise_in_pipeline(self):
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=2000.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-45.0,
+            aux_photon_sources=[DarkNoise(rate_hz=2000.0)],
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=False,
+        )
+        assert isinstance(result, Waveform)
+
+    def test_full_sbnd_like_pipeline(self):
+        """Dark noise + digitization together."""
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=2000.0, tick_ns=2.0, device=DEVICE),
+            device="cpu", tick_ns=2.0, gain=-20.0,
+            aux_photon_sources=[DarkNoise(rate_hz=2000.0)],
+            digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+        ))
+        result = sim.simulate(
+            torch.zeros(10, 3), torch.full((10,), 100), torch.zeros(10),
+            stitched=True,
+        )
+        assert isinstance(result, SlicedWaveform)
+        assert result.adc.min().item() >= 0
+        assert result.adc.max().item() <= 16383
+        assert torch.equal(result.adc, result.adc.round())

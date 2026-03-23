@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, List, Union
+from typing import Any, List, Optional, Union
 
 import torch
 
@@ -11,7 +11,8 @@ ArrayLike = Union[torch.Tensor, Any]
 
 from dataclasses import dataclass, field
 
-from .base import ConvolutionKernelBase, DelaySamplerBase, TOFSamplerBase
+from .base import ConvolutionKernelBase, DelaySamplerBase, PhotonSourceBase, TOFSamplerBase
+from .digitize import DigitizationConfig
 from .sampler import create_default_tof_sampler
 from .delays import Delays, create_default_delays
 from .kernels import create_default_kernel
@@ -25,6 +26,9 @@ class OpticalSimConfig:
     tof_sampler: TOFSamplerBase = field(default_factory=create_default_tof_sampler)
     delays: Union[Delays, List[DelaySamplerBase]] = field(default_factory=create_default_delays)
     kernel: ConvolutionKernelBase = field(default_factory=create_default_kernel)
+
+    aux_photon_sources: List[PhotonSourceBase] = field(default_factory=list)
+    digitization: Optional[DigitizationConfig] = None
 
     device: str = "cuda"
     tick_ns: float = 1.0
@@ -77,13 +81,31 @@ class OpticalSimulator:
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
 
-        # 3. Build histograms
+        # 3. Inject auxiliary photon sources (dark noise, etc.)
+        if cfg.aux_photon_sources and times.numel() > 0:
+            t_start = times.min().item()
+            t_end = times.max().item()
+            for source in cfg.aux_photon_sources:
+                aux_times, aux_channels = source.sample(
+                    cfg.n_channels, t_start, t_end, device
+                )
+                if aux_times.numel() > 0:
+                    times = torch.cat([times, aux_times])
+                    channels = torch.cat([channels, aux_channels])
+
+        # 4. Build histograms
         extra_args = {}
         wvfm_cls = SlicedWaveform if stitched else Waveform
         if stitched:
             extra_args["kernel_extent_ns"] = cfg.kernel().shape[0] * cfg.tick_ns
-        
+
         wf = wvfm_cls.from_photons(times, channels, cfg.tick_ns, cfg.n_channels, **extra_args)
 
-        # 4. Convolve
-        return wf.convolve(cfg.kernel(), cfg.gain)
+        # 5. Convolve
+        wf = wf.convolve(cfg.kernel(), cfg.gain)
+
+        # 6. Digitize (optional)
+        if cfg.digitization is not None:
+            wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
+
+        return wf

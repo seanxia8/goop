@@ -48,6 +48,39 @@ class DelaySamplerBase(ABC):
         ...
 
 
+class PhotonSourceBase(ABC):
+    """Base class for auxiliary photon sources (dark noise, afterpulsing, etc.).
+
+    Unlike DelaySamplerBase (which adds time offsets to existing photons),
+    PhotonSourceBase creates NEW photons with their own times and channels.
+    Called between delay sampling and histogramming in the pipeline.
+    """
+
+    @abstractmethod
+    def sample(
+        self,
+        n_channels: int,
+        t_start_ns: float,
+        t_end_ns: float,
+        device: torch.device,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Generate auxiliary photon hits.
+
+        Parameters
+        ----------
+        n_channels : Total number of PMT channels.
+        t_start_ns : Start of the time window in ns.
+        t_end_ns : End of the time window in ns.
+        device : Torch device.
+
+        Returns
+        -------
+        times : (M,) photon arrival times in ns.
+        channels : (M,) PMT channel IDs.
+        """
+        ...
+
+
 class ConvolutionKernelBase(ABC):
     """Base class for impulse-response kernels.
 

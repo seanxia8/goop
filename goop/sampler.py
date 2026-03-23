@@ -26,6 +26,7 @@ def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
         "lazy": False,
         "device": "cuda:0",
         "interpolate": True,
+        "pmt_qe": 0.12,  #incl. TPB reemission, see https://link.springer.com/article/10.1140/epjc/s10052-024-13306-3
     }
     default_kwargs.update(kwargs)
 
@@ -47,7 +48,6 @@ class TOFSampler(TOFSamplerBase):
         self._device = torch.device(device)
         self._lazy = lazy
         self._interpolate = interpolate
-        self._pmt_qe_input = pmt_qe  # stored until n_pmts is known
 
         with h5py.File(filepath, "r") as f:
             self._n_voxels = f["vis"].shape[0]

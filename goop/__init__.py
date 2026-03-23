@@ -1,6 +1,6 @@
 """Optical TPC simulation pipeline package."""
 
-from .base import ConvolutionKernelBase, DelaySamplerBase, TOFSamplerBase
+from .base import ConvolutionKernelBase, DelaySamplerBase, PhotonSourceBase, TOFSamplerBase
 from .delays import (
     Delays,
     ScintillationBiexponentialDelay,
@@ -8,7 +8,9 @@ from .delays import (
     TTSDelay,
     create_default_delays,
 )
+from .digitize import DigitizationConfig
 from .kernels import RLCKernel, SERKernel
+from .noise import DarkNoise
 from .sampler import TOFSampler
 from .simulator import OpticalSimConfig, OpticalSimulator
 from .waveform import SlicedWaveform, Waveform
@@ -16,6 +18,7 @@ from .waveform import SlicedWaveform, Waveform
 __all__ = [
     "ConvolutionKernelBase",
     "DelaySamplerBase",
+    "PhotonSourceBase",
     "TOFSamplerBase",
     "OpticalSimConfig",
     "ScintillationBiexponentialDelay",
@@ -23,6 +26,8 @@ __all__ = [
     "TTSDelay",
     "Delays",
     "create_default_delays",
+    "DigitizationConfig",
+    "DarkNoise",
     "RLCKernel",
     "TOFSampler",
     "OpticalSimulator",

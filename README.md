@@ -11,8 +11,10 @@ edepsim steps (position, dE, t)
 1. Photon yield:  dE * light_yield -> n_photons per step
 2. TOF sampling:  photon library lookup + pmt QE (+ conversion efficiency in future?) -> arrival times & PMT channels
 3. Delays:        scintillation + TPB re-emission + PMT TTS jitter
-4. Histogramming: bin photon times into per-channel waveforms
-5. Convolution:   FFT convolve with detector impulse response (SER kernel)
+4. Aux sources:   dark noise injection (+ afterpulsing, crosstalk, etc.)
+5. Histogramming: bin photon times into per-channel waveforms
+6. Convolution:   FFT convolve with detector impulse response (SER kernel)
+7. Digitization:  pedestal + quantization + ADC saturation (optional)
     |
     v
 SlicedWaveform (compressed) or Waveform (full)
@@ -48,6 +50,29 @@ sim = OpticalSimulator(config)
 result = sim.simulate(pos, n_photons, t_step, stitched=True)
 ```
 
+### With digitization and dark noise
+
+```python
+from goop.noise import DarkNoise
+from goop.digitize import DigitizationConfig
+
+config = OpticalSimConfig(
+    tof_sampler=create_default_tof_sampler(lazy=True),
+    delays=[
+        ScintillationBiexponentialDelay(),
+        TPBExponentialDelay(tau_ns=20.0),
+        TTSDelay(fwhm_ns=2.4),
+    ],
+    kernel=SERKernel(device=torch.device("cuda")),
+    tick_ns=2.0,       # 500 MHz
+    gain=-20.0,        # ADC counts per PE
+    aux_photon_sources=[DarkNoise(rate_hz=2000.0)],
+    digitization=DigitizationConfig(n_bits=14, pedestal=1500.0),
+)
+result = OpticalSimulator(config).simulate(pos, n_photons, t_step)
+# result.adc values are now integers in [0, 16383]
+```
+
 ### Output types
 
 **`SlicedWaveform`** (`stitched=True`, default) — compressed CSR format, only stores active regions:
@@ -71,7 +96,7 @@ result.t0        # time origin (ns)
 result.tick_ns   # time bin width (ns)
 ```
 
-Note that waveform ADC values are currently stored as **float32** and are **not digitized** (no ADC quantization, no noise floor, no saturation). The output is the raw analog response of the detector model. Digitization and realistic noise injection are TODO.
+Without digitization enabled, waveform values are **float32** (raw analog response). With `DigitizationConfig`, output values are integer-valued float32 in `[0, 2^n_bits - 1]`.
 
 ## Extensibility
 
@@ -90,7 +115,18 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 | `SERKernel` | PMT single-electron response (bi-exponential pulse + AC-coupled overshoot) |
 | `RLCKernel` | Damped-oscillator (RLC circuit) impulse response |
 
-Custom components just need to implement `__call__` and can be passed directly to `OpticalSimConfig`.
+**Auxiliary photon sources** (subclass `PhotonSourceBase`):
+| Class | Model |
+|-------|-------|
+| `DarkNoise` | Poisson dark-count noise, uniform in time per channel |
+
+**Digitization** (`DigitizationConfig`):
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `n_bits` | 14 | ADC bit depth (14-bit → [0, 16383]) |
+| `pedestal` | 1500.0 | Baseline offset in ADC counts |
+
+Custom components just need to implement the relevant ABC and can be passed directly to `OpticalSimConfig`.
 
 ## Worked example
 
@@ -105,6 +141,8 @@ goop/
     waveform_utils.py helper functions (slicing, FFT utilities)
     kernels.py        RLCKernel, SERKernel (impulse response models)
     delays.py         ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
+    noise.py          DarkNoise (auxiliary photon sources)
+    digitize.py       DigitizationConfig, digitize (ADC quantization)
     sampler.py        TOFSampler (PCA-compressed photon library)
     base.py           abstract base classes
 ```
@@ -117,6 +155,5 @@ python -m pytest test_simulator.py -v
 
 ## TODO
 
-1. digitization of ADC
-2. saving mechanism for PMT waveforms
-3. benchmarking for speed/mem. usage
+1. saving mechanism for PMT waveforms
+2. benchmarking for speed/mem. usage

@@ -10,6 +10,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .digitize import digitize as _digitize
 from .waveform_utils import _next_fft_size, _slice_channel
 
 
@@ -100,6 +101,13 @@ class Waveform:
             tick_ns=self.tick_ns,
             n_channels=self.n_channels,
             n_bins=self.data.shape[1],
+        )
+
+    def digitize(self, pedestal: float, n_bits: int) -> Waveform:
+        """Apply pedestal, quantize, and saturate to ADC range."""
+        return Waveform(
+            data=_digitize(self.data, pedestal, n_bits),
+            t0=self.t0, tick_ns=self.tick_ns, n_channels=self.n_channels,
         )
 
     def convolve(self, kernel: torch.Tensor, gain: float) -> Waveform:
@@ -291,6 +299,18 @@ class SlicedWaveform:
             real_wf[r0:end] = chunk_data[:end - r0]
 
         return ch_t0, real_wf
+
+    def digitize(self, pedestal: float, n_bits: int) -> SlicedWaveform:
+        """Apply pedestal, quantize, and saturate to ADC range."""
+        return SlicedWaveform(
+            adc=_digitize(self.adc, pedestal, n_bits),
+            offsets=self.offsets.clone(),
+            t0_ns=self.t0_ns.clone(),
+            pmt_id=self.pmt_id.clone(),
+            tick_ns=self.tick_ns,
+            n_channels=self.n_channels,
+            n_bins=self.n_bins,
+        )
 
     def convolve(self, kernel: torch.Tensor, gain: float) -> SlicedWaveform:
         """FFT-convolve each chunk independently with kernel and apply gain."""
