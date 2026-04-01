@@ -84,11 +84,18 @@ class PhotonSourceBase(ABC):
 class ConvolutionKernelBase(ABC):
     """Base class for impulse-response kernels.
 
-    Subclasses must store tick_ns and device as attributes,
-    and implement __call__ (returns kernel tensor).
+    Subclasses must be @dataclass with tick_ns, device, and _kernel_cache
+    attributes, and implement __call__ (returns kernel tensor).
     """
 
     @abstractmethod
     def __call__(self) -> torch.Tensor:
         """Return 1-D kernel tensor (time domain)."""
         ...
+
+    def with_tick_ns(self, tick_ns: float) -> ConvolutionKernelBase:
+        """Return a copy with different tick_ns (cache cleared)."""
+        from dataclasses import replace
+        new = replace(self, tick_ns=tick_ns)
+        new._kernel_cache = None
+        return new

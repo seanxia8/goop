@@ -6,7 +6,6 @@ import math
 from dataclasses import dataclass, field
 from typing import List, Tuple
 
-import numpy as np
 import torch
 import torch.nn.functional as F
 
@@ -73,7 +72,7 @@ class Waveform:
         bin_idx = (shifted / tick_ns).long().clamp(max=n_bins - 1)
 
         flat_idx = channels.long() * n_bins + bin_idx
-        w = weights if weights is not None else torch.ones(flat_idx.shape[0], device=device, dtype=torch.float32)
+        w = weights if weights is not None else torch.ones_like(flat_idx, dtype=torch.float32)
         data.view(-1).scatter_add_(0, flat_idx, w)
 
         return Waveform(adc=data, t0=t0, tick_ns=tick_ns, n_channels=n_channels)
@@ -108,7 +107,7 @@ class Waveform:
             tick_ns=self.tick_ns,
             n_channels=self.n_channels,
             n_bins=self.adc.shape[1],
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def digitize(self, pedestal: float, n_bits: int) -> Waveform:
@@ -116,7 +115,7 @@ class Waveform:
         return Waveform(
             adc=_digitize(self.adc, pedestal, n_bits),
             t0=self.t0, tick_ns=self.tick_ns, n_channels=self.n_channels,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def convolve(self, kernel: torch.Tensor, gain: float) -> Waveform:
@@ -134,7 +133,7 @@ class Waveform:
         return Waveform(
             adc=result[:, :out_len], t0=self.t0,
             tick_ns=self.tick_ns, n_channels=self.n_channels,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def downsample(self, factor: int) -> Waveform:
@@ -151,7 +150,7 @@ class Waveform:
         return Waveform(
             adc=coarse, t0=self.t0,
             tick_ns=self.tick_ns * factor, n_channels=self.n_channels,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
 
@@ -239,7 +238,7 @@ class SlicedWaveform:
             n_bins = int(compressed_t[-1].item() / tick_ns) + 1
             bin_idx = (compressed_t / tick_ns).long().clamp(max=n_bins - 1)
             hist = torch.zeros(n_bins, device=device, dtype=torch.float32)
-            w = ch_w if ch_w is not None else torch.ones(bin_idx.shape[0], device=device, dtype=torch.float32)
+            w = ch_w if ch_w is not None else torch.ones_like(bin_idx, dtype=torch.float32)
             hist.scatter_add_(0, bin_idx, w)
 
             gap_mask = diffs > kernel_extent_ns
@@ -278,7 +277,7 @@ class SlicedWaveform:
             return Waveform(
                 adc=torch.zeros(self.n_channels, 1, device=self.adc.device),
                 t0=0.0, tick_ns=self.tick_ns, n_channels=self.n_channels,
-                attrs=self.attrs,
+                attrs=dict(self.attrs),
             )
 
         global_t0 = self.t0_ns.min().item()
@@ -307,7 +306,7 @@ class SlicedWaveform:
         return Waveform(
             adc=data, t0=global_t0,
             tick_ns=self.tick_ns, n_channels=self.n_channels,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def deslice_channel(self, channel: int) -> Tuple[float, torch.Tensor]:
@@ -355,7 +354,7 @@ class SlicedWaveform:
             tick_ns=self.tick_ns,
             n_channels=self.n_channels,
             n_bins=self.n_bins,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def convolve(self, kernel: torch.Tensor, gain: float) -> SlicedWaveform:
@@ -390,7 +389,7 @@ class SlicedWaveform:
             tick_ns=self.tick_ns,
             n_channels=self.n_channels,
             n_bins=new_n_bins,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )
 
     def downsample(self, factor: int) -> SlicedWaveform:
@@ -420,5 +419,5 @@ class SlicedWaveform:
             tick_ns=coarse_tick,
             n_channels=self.n_channels,
             n_bins=new_n_bins,
-            attrs=self.attrs,
+            attrs=dict(self.attrs),
         )

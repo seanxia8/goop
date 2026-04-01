@@ -70,13 +70,6 @@ class RLCKernel(ConvolutionKernelBase):
             self._kernel_cache = c * integral / dt
         return self._kernel_cache
 
-    def with_tick_ns(self, tick_ns: float) -> RLCKernel:
-        """Return a copy with different tick_ns (cache cleared)."""
-        from dataclasses import replace
-        new = replace(self, tick_ns=tick_ns)
-        new._kernel_cache = None
-        return new
-
 
 @dataclass
 class SERKernel(ConvolutionKernelBase):
@@ -121,10 +114,3 @@ class SERKernel(ConvolutionKernelBase):
             self._kernel_cache = integral / dt
             self._kernel_cache *= self.kernel_adc_peak / self._kernel_cache.abs().amax()
         return self._kernel_cache
-
-    def with_tick_ns(self, tick_ns: float) -> SERKernel:
-        """Return a copy with different tick_ns (cache cleared)."""
-        from dataclasses import replace
-        new = replace(self, tick_ns=tick_ns)
-        new._kernel_cache = None
-        return new

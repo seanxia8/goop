@@ -51,9 +51,9 @@ class OpticalSimulator:
     def __init__(self, config: OpticalSimConfig):
         self.config = config
         self._device = torch.device(config.device)
+        self._fine_tick = config.tick_ns / config.oversample
         if config.oversample > 1:
-            fine_tick = config.tick_ns / config.oversample
-            self._fine_kernel = config.kernel.with_tick_ns(fine_tick)
+            self._fine_kernel = config.kernel.with_tick_ns(self._fine_tick)
         else:
             self._fine_kernel = config.kernel
 
@@ -103,7 +103,7 @@ class OpticalSimulator:
                     channels = torch.cat([channels, aux_channels])
 
         # 4. Build histograms (at fine resolution when oversampling)
-        fine_tick = cfg.tick_ns / cfg.oversample
+        fine_tick = self._fine_tick
         fine_kernel_tensor = self._fine_kernel()
         extra_args = {}
         wvfm_cls = SlicedWaveform if stitched else Waveform
