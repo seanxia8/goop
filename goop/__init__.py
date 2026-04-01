@@ -9,6 +9,7 @@ from .delays import (
     create_default_delays,
 )
 from .digitize import DigitizationConfig
+from .io import load_event_light, save_event_light, write_config_light
 from .kernels import RLCKernel, SERKernel
 from .noise import DarkNoise
 from .sampler import TOFSampler
@@ -33,4 +34,7 @@ __all__ = [
     "OpticalSimulator",
     "Waveform",
     "SlicedWaveform",
+    "write_config_light",
+    "save_event_light",
+    "load_event_light",
 ]
