@@ -108,6 +108,63 @@ Both types carry an `attrs` dict for arbitrary metadata. The simulator populates
 
 Without digitization enabled, waveform values are **float32** (raw analog response). With `DigitizationConfig`, output values are integer-valued float32 in `[0, 2^n_bits - 1]`.
 
+## Saving & loading waveforms
+
+`goop.io` provides HDF5 I/O that splits waveforms by detector side (east PMTs 0–80, west PMTs 81–161).
+
+### Saving
+
+```python
+import h5py
+from goop import OpticalSimConfig, OpticalSimulator, write_config_light, save_event_light
+
+config = OpticalSimConfig(...)
+sim = OpticalSimulator(config)
+
+with h5py.File("light_output.h5", "w") as f:
+    write_config_light(f, config, source_file="input.h5", n_events=100)
+
+    for i in range(100):
+        wf = sim.simulate(pos, n_photons, t_step, stitched=True)
+        save_event_light(f, f"event_{i:03d}", wf,
+                         source_event_idx=i,
+                         digitized=True,   # store adc as uint16
+                         n_bits=14)        # scaleoffset for compression
+```
+
+### Loading
+
+```python
+from goop import load_event_light
+
+with h5py.File("light_output.h5", "r") as f:
+    wf = load_event_light(f, "event_000", device="cuda")
+    # returns a merged SlicedWaveform (east + west, global pmt_id 0-161)
+
+    wf.attrs["pe_counts"]     # (162,) PE counts per PMT
+    wf.deslice()              # decompress to full (162, n_bins) Waveform
+    wf.deslice_channel(42)    # single PMT -> (t0, 1D tensor)
+```
+
+### HDF5 layout
+
+```
+/config/                     file-level metadata (tick_ns, gain, digitization, etc.)
+/event_000/
+    attrs: source_event_idx
+    pe_counts_east  (81,) int32
+    pe_counts_west  (81,) int32
+    east/
+        adc      (N,) uint16 or float32     # gzip + scaleoffset
+        offsets  (K+1,) int64               # CSR chunk boundaries
+        t0_ns    (K,) float32               # chunk time origins
+        pmt_id   (K,) int32                 # local PMT index (0-80)
+    west/
+        (same structure, local PMT index 0-80)
+```
+
+When `digitized=True`, adc is stored as `uint16` with `scaleoffset=n_bits` for optimal compression. Otherwise stored as `float32`.
+
 ## Extensibility
 
 Each pipeline component is defined by an abstract base class (`base.py`), making it easy to swap in new physics models.
@@ -161,6 +218,7 @@ goop/
     noise.py          DarkNoise (auxiliary photon sources)
     digitize.py       DigitizationConfig, digitize (ADC quantization)
     sampler.py        TOFSampler (PCA-compressed photon library)
+    io.py             HDF5 save/load for SlicedWaveform (east/west split)
     base.py           abstract base classes
 ```
 
@@ -172,5 +230,4 @@ python -m pytest test_simulator.py -v
 
 ## TODO
 
-1. saving mechanism for PMT waveforms
-2. benchmarking for speed/mem. usage
+1. benchmarking for speed/mem. usage
