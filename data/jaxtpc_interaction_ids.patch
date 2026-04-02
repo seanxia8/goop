@@ -1,0 +1,46 @@
+diff --git a/tools/config.py b/tools/config.py
+index 6a35423..71aa142 100644
+--- a/tools/config.py
++++ b/tools/config.py
+@@ -458,6 +458,7 @@ class VolumeIntermediates(NamedTuple):
+     positions_cm: jnp.ndarray      # (N, 3) original positions (for NN response)
+     positions_yz_cm: jnp.ndarray   # (N, 2) projected (for wire distances)
+     t0_us: jnp.ndarray             # (N,) initial deposit time in μs
++    interaction_ids: jnp.ndarray    # (N,) interaction label (int16)
+ 
+ 
+ class PlaneIntermediates(NamedTuple):
+diff --git a/tools/physics.py b/tools/physics.py
+index 2effc7c..aed8bfa 100644
+--- a/tools/physics.py
++++ b/tools/physics.py
+@@ -126,6 +126,7 @@ def compute_volume_physics(
+         positions_cm=positions_cm,
+         positions_yz_cm=yz,
+         t0_us=deposits.t0_us,
++        interaction_ids=deposits.interaction_ids,
+     )
+ 
+ 
+diff --git a/tools/simulation.py b/tools/simulation.py
+index cf122a9..122749f 100644
+--- a/tools/simulation.py
++++ b/tools/simulation.py
+@@ -579,7 +579,7 @@ class DetectorSimulator:
+                 sce_fn = sce_factories[vol_idx]()
+                 vol_int = compute_volume_physics(
+                     vol_deps, sim_params, cfg.volumes[vol_idx], sce_fn, _recomb_fn)
+-                results.append((vol_int.charges, vol_int.photons, vol_int.positions_cm))
++                results.append((vol_int.charges, vol_int.photons, vol_int.positions_cm, vol_int.interaction_ids))
+             return results
+ 
+         self._light_calculator_jit = _calculate_light_jit
+@@ -681,7 +681,7 @@ class DetectorSimulator:
+ 
+         results = self._light_calculator_jit(sim_params, deposits.volumes)
+         filled_volumes = tuple(
+-            vol._replace(charge=results[v][0], photons=results[v][1])
++            vol._replace(charge=results[v][0], photons=results[v][1], interaction_ids=results[v][3])
+             for v, vol in enumerate(deposits.volumes)
+         )
+         return deposits._replace(volumes=filled_volumes)
