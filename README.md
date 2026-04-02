@@ -132,7 +132,8 @@ config = OpticalSimConfig(...)
 sim = OpticalSimulator(config)
 
 with h5py.File("light_output.h5", "w") as f:
-    write_config_light(f, config, n_volumes=2, source_file="input.h5", n_events=100)
+    write_config_light(f, config, label_key="volume", n_labels=2,
+                       source_file="input.h5", n_events=100)
 
     for i in range(100):
         waveforms = sim.simulate(pos, n_photons, t_step,
@@ -151,7 +152,7 @@ from goop import load_event_light
 
 with h5py.File("light_output.h5", "r") as f:
     wfs = load_event_light(f, "event_000", device="cuda")
-    # returns list[SlicedWaveform], one per volume
+    # returns list[SlicedWaveform], one per label
 
     for wf in wfs:
         wf.attrs["pe_counts"]     # (n_channels,) PE counts per PMT
@@ -162,16 +163,16 @@ with h5py.File("light_output.h5", "r") as f:
 ### HDF5 layout
 
 ```
-/config/                     file-level metadata (tick_ns, gain, n_volumes, etc.)
+/config/                     file-level metadata (tick_ns, gain, label_key, n_labels, etc.)
 /event_000/
-    attrs: source_event_idx, n_volumes
-    volume_0/
-        adc        (N,) uint16 or float32   # gzip + scaleoffset
+    attrs: source_event_idx, n_labels
+    label_0/
+        adc        (N,) uint16 or float32   # gzip + shuffle
         offsets    (K+1,) int64             # CSR chunk boundaries
         t0_ns      (K,) float32             # chunk time origins
         pmt_id     (K,) int32               # global PMT index
-        pe_counts  (n_channels,) int32      # PE per PMT from volume 0
-    volume_1/
+        pe_counts  (n_channels,) int32      # PE per PMT from label 0
+    label_1/
         (same structure)
 ```
 

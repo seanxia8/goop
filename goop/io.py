@@ -19,7 +19,8 @@ if TYPE_CHECKING:
 def write_config_light(
     f: h5py.File,
     config: OpticalSimConfig,
-    n_volumes: int = 2,
+    label_key: str = "volume",
+    n_labels: int = 2,
     dataset_name: str = "",
     file_index: int = 0,
     source_file: str = "",
@@ -35,7 +36,8 @@ def write_config_light(
     # Simulator parameters
     a["tick_ns"] = config.tick_ns
     a["n_channels"] = config.n_channels
-    a["n_volumes"] = n_volumes
+    a["label_key"] = label_key
+    a["n_labels"] = n_labels
     a["gain"] = config.gain
     a["oversample"] = config.oversample
     a["ser_jitter_std"] = config.ser_jitter_std
@@ -101,10 +103,11 @@ def save_event_light(
     """
     evt = f.create_group(event_key)
     evt.attrs["source_event_idx"] = source_event_idx
-    evt.attrs["n_volumes"] = len(waveforms)
+    evt.attrs["n_labels"] = len(waveforms)
 
     for v, wvfm in enumerate(waveforms):
-        vol_grp = evt.create_group(f"volume_{v}")
+        label_val = wvfm.attrs.get("label", v)
+        vol_grp = evt.create_group(f"label_{label_val}")
 
         # PE counts
         pe = wvfm.attrs.get("pe_counts")
@@ -121,9 +124,9 @@ def load_event_light(
     event_key: str,
     device: str = "cpu",
 ) -> List[SlicedWaveform]:
-    """Load per-volume :class:`SlicedWaveform` objects for one event.
+    """Load per-label :class:`SlicedWaveform` objects for one event.
 
-    Returns a list of SlicedWaveforms (one per volume). To get the combined
+    Returns a list of SlicedWaveforms (one per label). To get the combined
     signal, deslice each and sum the resulting dense waveforms.
     """
     cfg = f["config"].attrs
@@ -131,17 +134,23 @@ def load_event_light(
     n_channels = int(cfg["n_channels"])
 
     evt = f[event_key]
-    n_volumes = int(evt.attrs["n_volumes"])
+
+    # Discover label groups (label_0, label_1, ...) sorted by label value
+    label_keys = sorted(
+        [k for k in evt.keys() if k.startswith("label_")],
+        key=lambda k: int(k.split("_", 1)[1]),
+    )
 
     result = []
-    for v in range(n_volumes):
-        g = evt[f"volume_{v}"]
+    for lk in label_keys:
+        g = evt[lk]
         adc = torch.tensor(g["adc"][:], dtype=torch.float32, device=device)
         offsets = torch.tensor(g["offsets"][:], dtype=torch.long, device=device)
         t0_ns = torch.tensor(g["t0_ns"][:], dtype=torch.float32, device=device)
         pmt_id = torch.tensor(g["pmt_id"][:], dtype=torch.long, device=device)
 
-        attrs: dict = {}
+        label_val = int(lk.split("_", 1)[1])
+        attrs: dict = {"label": label_val}
         if "pe_counts" in g:
             attrs["pe_counts"] = torch.tensor(g["pe_counts"][:], dtype=torch.long, device=device)
 

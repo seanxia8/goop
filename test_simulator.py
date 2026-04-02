@@ -47,7 +47,8 @@ class MockTOFSampler:
         times = torch.cat([t1, t2])
         channels = torch.randint(0, self._n_channels, (times.shape[0],), generator=g, device=DEVICE)
         times = times + t_step.mean()
-        return times, channels
+        source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
+        return times, channels, source_idx
 
 
 class _SeededMockTOF:
@@ -75,7 +76,9 @@ class _SeededMockTOF:
     def sample(self, pos, n_photons, t_step):
         if self._data is None:
             self._data = self._generate(n_photons)
-        return self._data[0].clone(), self._data[1].clone()
+        n = self._data[0].shape[0]
+        source_idx = torch.arange(n, device=DEVICE) % pos.shape[0]
+        return self._data[0].clone(), self._data[1].clone(), source_idx
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +348,7 @@ class TestSimulateReturnsTypes:
         mock = MockTOFSampler(n_channels=4)
         mock.sample = lambda pos, n_ph, t_step: (
             torch.zeros(0, device=DEVICE),
+            torch.zeros(0, device=DEVICE, dtype=torch.long),
             torch.zeros(0, device=DEVICE, dtype=torch.long),
         )
         sim = OpticalSimulator(OpticalSimConfig(
@@ -1163,6 +1167,7 @@ class TestBaselineNoise:
         mock = MockTOFSampler(n_channels=4)
         mock.sample = lambda pos, n_ph, t_step: (
             torch.zeros(0, device=DEVICE),
+            torch.zeros(0, device=DEVICE, dtype=torch.long),
             torch.zeros(0, device=DEVICE, dtype=torch.long),
         )
         sim = OpticalSimulator(OpticalSimConfig(
