@@ -24,7 +24,7 @@ class OpticalSimConfig:
     """
 
     tof_sampler: TOFSamplerBase = field(default_factory=create_default_tof_sampler)
-    delays: Union[Delays, List[DelaySamplerBase]] = field(default_factory=create_default_delays)
+    delays: Union[Delays, List[DelaySamplerBase]] = field(default_factory=list)
     kernel: ConvolutionKernelBase = field(default_factory=create_default_kernel)
 
     aux_photon_sources: List[PhotonSourceBase] = field(default_factory=list)

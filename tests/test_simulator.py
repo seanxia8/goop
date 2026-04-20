@@ -682,6 +682,35 @@ class TestDigitize:
         assert torch.equal(result, result.round())
 
 
+class TestDigitizeSTE:
+    """digitize_ste: same forward as digitize, identity backward."""
+
+    def test_forward_matches_digitize(self):
+        from goop.digitize import digitize_ste
+        data = torch.linspace(-2000.0, 20000.0, 500)
+        ref = digitize(data, pedestal=1500.0, n_bits=14)
+        ste = digitize_ste(data, pedestal=1500.0, n_bits=14)
+        assert torch.equal(ref, ste), "STE forward must match plain digitize exactly"
+
+    def test_backward_is_identity(self):
+        from goop.digitize import digitize_ste
+        x = torch.tensor([100.0, 1500.0, 16000.0, -5000.0], requires_grad=True)
+        # Sum of STE outputs → expected gradient wrt x is 1 everywhere
+        digitize_ste(x, pedestal=1500.0, n_bits=14).sum().backward()
+        assert torch.allclose(x.grad, torch.ones_like(x))
+
+    def test_plain_digitize_blocks_grad(self):
+        """Sanity check: plain digitize *should* have zero/no gradient."""
+        x = torch.tensor([100.0, 1500.0], requires_grad=True)
+        out = digitize(x, pedestal=1500.0, n_bits=14)
+        # round/clamp produce zero gradient → x.grad stays None or is zero
+        try:
+            out.sum().backward()
+        except RuntimeError:
+            return  # no grad_fn, as expected
+        assert x.grad is None or x.grad.abs().max().item() == 0
+
+
 class TestWaveformDigitize:
     def test_waveform_digitize(self):
         wf = Waveform(

@@ -8,11 +8,21 @@ from .delays import (
     TTSDelay,
     create_default_delays,
 )
+from .diff_simulator import DifferentiableOpticalSimulator
 from .digitize import DigitizationConfig
 from .io import load_event_light, save_event_light, write_config_light
-from .kernels import RLCKernel, SERKernel
+from .kernels import (
+    Response,
+    RLCKernel,
+    ScintillationKernel,
+    SERKernel,
+    TPBExponentialKernel,
+    TPBTriexponentialKernel,
+    TTSKernel,
+    create_default_response,
+)
 from .noise import DarkNoise
-from .sampler import TOFSampler
+from .sampler import DifferentiableTOFSampler, TOFSampler
 from .simulator import OpticalSimConfig, OpticalSimulator
 from .waveform import SlicedWaveform, Waveform
 
@@ -30,6 +40,15 @@ __all__ = [
     "DigitizationConfig",
     "DarkNoise",
     "RLCKernel",
+    "Response",
+    "ScintillationKernel",
+    "SERKernel",
+    "TPBExponentialKernel",
+    "TPBTriexponentialKernel",
+    "TTSKernel",
+    "create_default_response",
+    "DifferentiableOpticalSimulator",
+    "DifferentiableTOFSampler",
     "TOFSampler",
     "OpticalSimulator",
     "Waveform",

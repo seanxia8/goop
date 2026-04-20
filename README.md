@@ -54,6 +54,47 @@ result = sim.simulate(pos, n_photons, t_step, stitched=True)
 result.attrs["pe_counts"]  # (n_channels,) detected PE per PMT
 ```
 
+### Differentiable simulator
+
+`DifferentiableOpticalSimulator` runs the same pipeline with all gradient-blocking ops replaced or modified: all per-photon delay sampling (e.g., scintillation / TPB reemission delays) becomes a `Response` composite-kernel convolution (Scint * TPB * TTS * SER), per-photon TOF sampling becomes deterministic PDF deposition (which gives the expectation), and ADC quantization is wrapped in a straight-through estimator (`digitize_ste`). 
+
+Gradients flow from `pos`, `t_step`, `n_photons` alll the way through to `sw.adc` and `sw.attrs["pe_counts"]`.
+
+```python
+from goop import (
+    DifferentiableOpticalSimulator, DifferentiableTOFSampler,
+    OpticalSimConfig, Response, ScintillationKernel,
+    TPBExponentialKernel, TTSKernel, SERKernel,
+)
+from goop.delays import Delays
+from goop.sampler import DEFAULT_PLIB_PATH
+
+device = torch.device("cuda")
+
+config = OpticalSimConfig(
+    tof_sampler=DifferentiableTOFSampler(DEFAULT_PLIB_PATH, device=str(device)),
+    delays=Delays([]),  # delays are now in the kernel — see below
+    kernel=Response(
+        kernels=[
+            ScintillationKernel(device=device),
+            TPBExponentialKernel(device=device),
+            TTSKernel(device=device),
+            SERKernel(duration_ns=2000.0, device=device),
+        ],
+        tick_ns=1.0, device=device,
+    ),
+    device=str(device), tick_ns=1.0, gain=-45.0,
+)
+sim = DifferentiableOpticalSimulator(config)
+
+# n_photons (and pos/t_step) can carry requires_grad=True
+n_photons = torch.full((n_pos,), 10_000.0, device=device, requires_grad=True)
+sw = sim.simulate(pos, n_photons, t_step, stitched=True)
+
+loss = sw.adc.pow(2).sum()
+loss.backward()           # n_photons.grad now populated
+```
+
 ### Per-label waveforms
 
 Split output by any per-position grouping (detector volume, interaction ID, etc.). TOF sampling and delays are batched; the rest of the pipeline runs in a single call via virtual-channel remapping, then the combined waveform is split by label.
@@ -233,22 +274,24 @@ See [`notebooks/minimal_example.ipynb`](notebooks/minimal_example.ipynb) for a c
 
 ```
 goop/
-    simulator.py      OpticalSimConfig, OpticalSimulator
-    waveform.py       Waveform, SlicedWaveform
-    waveform_utils.py helper functions (slicing, FFT utilities)
-    kernels.py        RLCKernel, SERKernel (impulse response models)
-    delays.py         ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
-    noise.py          DarkNoise (auxiliary photon sources)
-    digitize.py       DigitizationConfig, digitize (ADC quantization)
-    sampler.py        TOFSampler (PCA-compressed photon library)
-    io.py             HDF5 save/load for per-volume SlicedWaveforms
-    base.py           abstract base classes
+    simulator.py       OpticalSimConfig, OpticalSimulator
+    diff_simulator.py  DifferentiableOpticalSimulator
+    waveform.py        Waveform, SlicedWaveform
+    waveform_utils.py  helper functions (slicing, FFT utilities)
+    kernels.py         RLCKernel, SERKernel, ScintillationKernel, TPBExponentialKernel,
+                       TPBTriexponentialKernel, TTSKernel, Response (composite via FFT)
+    delays.py          ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
+    noise.py           DarkNoise (auxiliary photon sources)
+    digitize.py        DigitizationConfig, digitize, digitize_ste (STE for backprop)
+    sampler.py         TOFSampler, DifferentiableTOFSampler (PCA-compressed photon library)
+    io.py              HDF5 save/load for per-volume SlicedWaveforms
+    base.py            abstract base classes
 ```
 
 ## Tests
 
 ```bash
-python -m pytest test_simulator.py -v
+python -m pytest tests/ -v
 ```
 
 ## TODO

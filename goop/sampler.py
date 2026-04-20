@@ -10,6 +10,7 @@ from .base import TOFSamplerBase
 
 __all__ = [
     "create_default_tof_sampler",
+    "DifferentiableTOFSampler",
     "TOFSampler",
 ]
 
@@ -19,8 +20,6 @@ DEFAULT_N_SIMULATED = 15_000_000
 
 def create_default_tof_sampler(**kwargs) -> TOFSamplerBase:
     """Create a TOFSampler with the standard photon library."""
-    from .sampler import TOFSampler
-
     default_kwargs = {
         "n_simulated": DEFAULT_N_SIMULATED,
         "lazy": False,
@@ -79,6 +78,61 @@ class TOFSampler(TOFSamplerBase):
 
         self._file = h5py.File(filepath, "r", swmr=True) if lazy else None
         self._pmt_qe = float(pmt_qe) if pmt_qe is not None else 1.0
+
+    @classmethod
+    def from_arrays(
+        cls,
+        *,
+        vis: torch.Tensor,
+        t0: torch.Tensor,
+        coeffs: torch.Tensor,
+        pca_mean: torch.Tensor,
+        pca_components: torch.Tensor,
+        u_grid: torch.Tensor,
+        numvox: torch.Tensor,
+        min_xyz: torch.Tensor,
+        max_xyz: torch.Tensor,
+        log_quantile_C: float = 1e-2,
+        t_max_ns: float = 600.0,
+        mode: str = "log_quantile",
+        n_simulated: float = DEFAULT_N_SIMULATED,
+        device: str = "cpu",
+        interpolate: bool = True,
+        pmt_qe: float = 1.0,
+    ) -> "TOFSampler":
+        """Construct a TOFSampler from in-memory arrays, bypassing h5 file loading.
+
+        Useful for tests and synthetic libraries.  Shapes:
+          vis: (n_voxels, n_pmts), t0: (n_voxels, n_pmts),
+          coeffs: (n_voxels, n_pmts, n_components),
+          pca_mean: (Q,), pca_components: (K, Q), u_grid: (Q,),
+          numvox: (3,), min_xyz: (3,), max_xyz: (3,)
+        """
+        inst = cls.__new__(cls)
+        dev = torch.device(device)
+        inst.n_simulated = n_simulated
+        inst._file = None
+        inst._device = dev
+        inst._lazy = False
+        inst._interpolate = interpolate
+        inst._n_voxels = vis.shape[0]
+        inst._n_pmts = vis.shape[1]
+        inst._n_components = coeffs.shape[2]
+        inst._log_quantile_C = float(log_quantile_C)
+        inst._t_max_ns = float(t_max_ns)
+        inst._mode = str(mode)
+        inst.pca_mean = pca_mean.to(dtype=torch.float32, device=dev)
+        inst.pca_components = pca_components.to(dtype=torch.float32, device=dev)
+        inst.u_grid = u_grid.to(dtype=torch.float32, device=dev)
+        inst._du = torch.diff(inst.u_grid, prepend=torch.zeros(1, device=dev))
+        inst._numvox = numvox.to(dtype=torch.long, device=dev)
+        inst._min_xyz = min_xyz.to(dtype=torch.float64, device=dev)
+        inst._max_xyz = max_xyz.to(dtype=torch.float64, device=dev)
+        inst.vis = vis.to(dtype=torch.float32, device=dev)
+        inst.t0 = t0.to(dtype=torch.float32, device=dev)
+        inst.coeffs = coeffs.to(dtype=torch.float32, device=dev)
+        inst._pmt_qe = float(pmt_qe)
+        return inst
 
     @property
     def n_channels(self) -> int:
@@ -360,3 +414,111 @@ class TOFSampler(TOFSamplerBase):
 
     def __del__(self):
         self.close()
+
+
+class DifferentiableTOFSampler(TOFSampler):
+    """TOFSampler variant exposing a differentiable PDF-deposition path.
+
+    The base ``sample()`` method (Poisson + inverse-CDF) is unchanged.  Adds
+    ``sample_pdf(...)`` which:
+
+    - replaces ``torch.poisson(expected)`` with ``expected`` directly
+      (no Poisson sampling — gradients flow to ``n_photons`` and to ``v``,
+      which itself depends on ``pos`` via the trilinear voxel interpolation);
+    - returns synthetic ``(times, channels, weights)`` triples so that
+      histogramming with those weights reproduces the per-PMT expected PDF.
+
+    Call ``sample_pdf`` from ``DifferentiableOpticalSimulator``: the diff
+    sim auto-detects this method and routes through the weighted-histogram
+    path instead of the stochastic ``sample()`` path.
+    """
+
+    def sample_pdf(
+        self,
+        pos,
+        n_photons,
+        t_step,
+        expected_eps: float = 1e-9,
+        chunk_size: int = 20000,
+    ):
+        """Deposit per-PMT expected PDF as weighted synthetic photons.
+
+        Returns
+        -------
+        times : (M*Q,) float32 — quantile times in ns (absolute, with t_step shift)
+        channels : (M*Q,) int64 — full-detector PMT id (0..161)
+        weights : (M*Q,) float32 — probability mass per (pair, quantile bin),
+            equal to ``expected[pair] * du[bin]`` so ``Σ weights[pair_q] = expected[pair]``.
+
+        ``M`` is the number of (position, PMT) pairs with ``expected > expected_eps``;
+        ``Q`` is the number of quantile grid points in the PCA library.
+        """
+        pos = pos if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
+        pos = pos.to(dtype=torch.float32, device=self._device)
+        if pos.dim() == 1:
+            pos = pos.unsqueeze(0)
+        N = pos.shape[0]
+        P = self._n_pmts
+
+        if isinstance(n_photons, (int, float)):
+            scale = torch.full(
+                (N,), float(n_photons) / self.n_simulated, device=self._device
+            )
+        else:
+            n_ph_t = n_photons if isinstance(n_photons, torch.Tensor) else torch.as_tensor(n_photons)
+            scale = n_ph_t.to(dtype=torch.float32, device=self._device) / self.n_simulated
+
+        if t_step is not None:
+            t_step_t = t_step if isinstance(t_step, torch.Tensor) else torch.as_tensor(t_step)
+            t_step = t_step_t.to(dtype=torch.float32, device=self._device)
+
+        all_times, all_ch, all_w = [], [], []
+
+        for start in range(0, N, chunk_size):
+            end = min(start + chunk_size, N)
+            chunk_pos = pos[start:end]
+            chunk_scale = scale[start:end]
+            C = end - start
+            chunk_t = t_step[start:end] if t_step is not None else None
+
+            on_pos_side = chunk_pos[:, 0] > 0
+            pos_lookup = chunk_pos.clone()
+            pos_lookup[on_pos_side, 0] = -pos_lookup[on_pos_side, 0]
+
+            v, t0, coeffs = self._lookup(pos_lookup)        # (C,P), (C,P), (C,P,K)
+            expected = v * chunk_scale.unsqueeze(1) * self._pmt_qe  # (C, P) — differentiable
+
+            # Threshold to skip negligible pairs (gradient is zero below; fine
+            # for noise-floor entries, threshold is safely small).
+            active_mask = expected.detach() > expected_eps
+            if not bool(active_mask.any()):
+                continue
+
+            active_expected = expected[active_mask]      # (M,)
+            active_coeffs = coeffs[active_mask]          # (M, K)
+            active_t0 = t0[active_mask]                  # (M,)
+
+            pmt_offset = torch.where(on_pos_side, P, 0).unsqueeze(1).expand(C, P)
+            pmt_base = torch.arange(P, device=self._device).unsqueeze(0).expand(C, -1)
+            active_pmt = (pmt_base + pmt_offset)[active_mask]  # (M,)
+
+            q_abs = self._quantile_times(active_coeffs, active_t0)  # (M, Q)
+
+            if chunk_t is not None:
+                t_expanded = chunk_t.unsqueeze(1).expand(C, P)
+                active_t_emit = t_expanded[active_mask]
+                q_abs = q_abs + active_t_emit.unsqueeze(-1)
+
+            Q = q_abs.shape[1]
+            times = q_abs.reshape(-1)                                                # (M*Q,)
+            channels = active_pmt.unsqueeze(-1).expand(-1, Q).reshape(-1)            # (M*Q,)
+            weights = (active_expected.unsqueeze(-1) * self._du.unsqueeze(0)).reshape(-1)  # (M*Q,)
+
+            all_times.append(times)
+            all_ch.append(channels)
+            all_w.append(weights)
+
+        if all_times:
+            return torch.cat(all_times), torch.cat(all_ch), torch.cat(all_w)
+        empty = torch.zeros(0, device=self._device)
+        return empty, empty.long(), empty
