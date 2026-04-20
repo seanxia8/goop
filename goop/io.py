@@ -63,7 +63,6 @@ def write_config_light(
     a["n_events"] = n_events
     a["global_event_offset"] = global_event_offset
 
-
 def _write_sliced_waveform(
     group: h5py.Group,
     waveform: SlicedWaveform,
@@ -82,6 +81,62 @@ def _write_sliced_waveform(
     group.create_dataset("t0_ns", data=waveform.t0_ns.cpu().numpy().astype(np.float32), compression="gzip")
     group.create_dataset("pmt_id", data=waveform.pmt_id.cpu().numpy().astype(np.int32), compression="gzip")
 
+def save_event_tpc(
+    f: h5py.File,
+    event_key: str,
+    positions: np.ndarray,
+    n_photons: np.ndarray,
+    t_step: np.ndarray,
+    labels: np.ndarray,
+    source_event_idx: int = 0,
+) -> np.ndarray:
+    """Save per-volume tpc interaction objects for one event.
+    Parameters
+    ----------
+    positions : np.ndarray
+        (N, 3) array of interaction positions
+    n_photons : np.ndarray
+        (N,) array of interaction photon counts
+    t_step : np.ndarray
+        (N,) array of interaction time steps
+    labels : np.ndarray
+        (N,) array of interaction labels
+    source_event_idx : int
+        Index of the source event
+    """
+    evt = f.create_group(event_key)
+    evt.attrs["source_event_idx"] = source_event_idx 
+    interaction_ids = np.unique(labels)    
+    evt.attrs["n_interactions"] = len(interaction_ids)
+
+    for i, int_id in enumerate(interaction_ids):
+        s_indices = np.where(labels == int_id)[0]
+        int_grp = evt.create_group(f"interaction_{i}")
+        int_grp.create_dataset("n_photons", data=n_photons[s_indices].astype(np.int32), compression="gzip")
+        int_grp.create_dataset("t_step", data=t_step[s_indices].astype(np.float32), compression="gzip")
+        int_grp.create_dataset("labels", data=np.array([int_id], dtype=np.int32), compression="gzip")
+        int_grp.create_dataset("positions", data=positions[s_indices].astype(np.float32), compression="gzip")
+
+    return interaction_ids
+
+def save_event_light_w_tpc(
+    f: h5py.File,
+    event_key: str,
+    waveforms: List[SlicedWaveform],
+    source_event_idx: int = 0,
+    tpc_interactions: np.ndarray = None,
+    digitized: bool = False,
+    n_bits: int = 0,
+) -> None:
+    if tpc_interactions is None:
+        save_event_light(f, event_key, waveforms, source_event_idx, digitized, n_bits)
+    else:
+        evt = f.require_group(event_key)
+        evt.attrs["n_labels"] = len(tpc_interactions)
+        for i, int_id in enumerate(tpc_interactions):
+            int_grp = evt[f"interaction_{i}"]
+            assert int_grp is not None, "Interaction group must be created"
+            ### new waveform format here ###
 
 def save_event_light(
     f: h5py.File,
@@ -118,6 +173,32 @@ def save_event_light(
         # Waveform data
         _write_sliced_waveform(vol_grp, wvfm, digitized, n_bits)
 
+
+def load_event_tpc(
+    f: h5py.File,
+    event_key: str,
+    device: str = "cpu",
+) -> List:
+    cfg = f["config"].attrs
+    evt = f[event_key]
+    n_interactions = evt.attrs["n_interactions"]
+    results = []
+    for i in range(n_interactions):
+        int_grp = evt[f"interaction_{i}"]
+        assert int_grp is not None, "Interaction group must be created"
+        positions = torch.tensor(int_grp["positions"][:], dtype=torch.float32, device=device)
+        n_photons = torch.tensor(int_grp["n_photons"][:], dtype=torch.int32, device=device)
+        t_step = torch.tensor(int_grp["t_step"][:], dtype=torch.float32, device=device)
+        labels = torch.tensor(int_grp["labels"][:], dtype=torch.int32, device=device)
+        results.append(
+            {
+                "positions": positions,
+                "n_photons": n_photons,
+                "t_step": t_step,
+                "labels": labels,
+            }
+        )
+    return results
 
 def load_event_light(
     f: h5py.File,
