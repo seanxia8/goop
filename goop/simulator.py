@@ -36,14 +36,18 @@ class OpticalSimConfig:
     gain: float = -45.0    # per PMT gain in ADC units
     ser_jitter_std: float = 0.0      # std of multiplicative Gaussian on PE weights
     baseline_noise_std: float = 0.0  # std of per-sample Gaussian ADC noise
+    calibration_mode: bool = False
+    n_modules: int = 1
+    n_labels_to_simulate: int = 3
+    time_window_ns: Optional[float] = None
 
     def __post_init__(self):
         if not isinstance(self.oversample, int) or self.oversample < 1:
             raise ValueError(f"oversample must be an int >= 1, got {self.oversample}")
-        self.n_channels = self.tof_sampler.n_channels
+        self.n_channels = self.tof_sampler.n_channels * self.n_modules
         if isinstance(self.delays, list):
             self.delays = Delays(self.delays)
-
+        self.n_labels_to_simulate = min(self.n_labels_to_simulate, 30)
 
 class OpticalSimulator:
     """Full optical TPC simulation pipeline."""
@@ -56,6 +60,7 @@ class OpticalSimulator:
             self._fine_kernel = config.kernel.with_tick_ns(self._fine_tick)
         else:
             self._fine_kernel = config.kernel
+
 
     def _simulate(
         self,
@@ -75,6 +80,7 @@ class OpticalSimulator:
         device = self._device
         fine_tick = self._fine_tick
         fine_kernel_tensor = self._fine_kernel()
+
         if n_channels is None:
             n_channels = cfg.n_channels
 
@@ -238,6 +244,7 @@ class OpticalSimulator:
             torch.from_dlpack(a) if not isinstance(a, torch.Tensor) else a
             for a in (pos, n_photons, t_step)
         )
+
         if labels is not None:
             labels = (
                 torch.from_dlpack(labels) if not isinstance(labels, torch.Tensor) else labels
@@ -245,6 +252,15 @@ class OpticalSimulator:
 
         if subtract_t0:
             t_step = t_step - t_step.min()
+        
+        if labels is not None:
+            unique_tpc_labels = torch.unique(labels)
+
+            if cfg.time_window_ns is not None:
+                rand_t0_per_label = torch.rand(len(unique_tpc_labels), device=labels.device) * cfg.time_window_ns
+                label_indices = torch.searchsorted(unique_tpc_labels, labels)
+                rand_t0 = rand_t0_per_label[label_indices]
+                t_step += rand_t0            
 
         # 1. TOF sampling (batched across all positions)
         times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
@@ -256,8 +272,8 @@ class OpticalSimulator:
         # Labeled mode
         if labels is not None:
             photon_labels = labels[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
-            unique_labels = torch.unique(labels)
-            n_labels = len(unique_labels)
+            unique_labels = torch.unique(labels)[:cfg.n_labels_to_simulate]
+            n_labels = len(unique_labels)            
             bs = label_batch_size or n_labels
 
             results: List[SlicedWaveform] = []
