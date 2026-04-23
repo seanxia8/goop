@@ -185,10 +185,16 @@ def load_event_light_w_tpc(
     event_key: str,
     device: str = "cpu",
 ):
-    """Load per-label :class:`SlicedWaveform` objects for one event.
+    """Load per-label :class:`SlicedWaveform` and TPC data for one event.
 
-    Returns a list of SlicedWaveforms (one per label). To get the combined
-    signal, deslice each and sum the resulting dense waveforms.
+    Returns
+    -------
+    wf_result : list[SlicedWaveform]
+        One waveform per label group.
+    tpc_result : list[dict]
+        One dict per label group with keys:
+        ``"positions"`` (N,3), ``"n_photons"`` (N,), ``"t_step"`` (N,),
+        ``"label"`` (int).
     """
     cfg = f["config"].attrs
     tick_ns = float(cfg["tick_ns"])
@@ -207,15 +213,14 @@ def load_event_light_w_tpc(
     tpc_result = []
     for lk in label_keys:
         g = evt[lk]
+        label_val = int(lk.split("_", 1)[1])
+
+        # Waveform
         adc = torch.tensor(g["adc"][:], dtype=torch.float32, device=device)
         offsets = torch.tensor(g["offsets"][:], dtype=torch.long, device=device)
         t0_ns = torch.tensor(g["t0_ns"][:], dtype=torch.float32, device=device)
         pmt_id = torch.tensor(g["pmt_id"][:], dtype=torch.long, device=device)
-        pos = torch.tensor(g["tpc_positions"][:], dtype=torch.float32, device=device)
-        n_photons = torch.tensor(g["tpc_n_photons"][:], dtype=torch.int32, device=device)
-        t_step = torch.tensor(g["tpc_t_step"][:], dtype=torch.float32, device=device)
 
-        label_val = int(lk.split("_", 1)[1])
         attrs: dict = {"label": label_val, "pedestal": pedestal}
         if "pe_counts" in g:
             attrs["pe_counts"] = torch.tensor(g["pe_counts"][:], dtype=torch.long, device=device)
@@ -229,7 +234,15 @@ def load_event_light_w_tpc(
             n_channels=n_channels,
             attrs=attrs,
         ))
-        tpc_result.append((pos, n_photons, t_step, label_val))
+
+        # TPC
+        tpc_result.append({
+            "positions": torch.tensor(g["tpc_positions"][:], dtype=torch.float32, device=device),
+            "n_photons": torch.tensor(g["tpc_n_photons"][:], dtype=torch.int32, device=device),
+            "t_step":    torch.tensor(g["tpc_t_step"][:], dtype=torch.float32, device=device),
+            "label":     label_val,
+        })
+
     return wf_result, tpc_result
 
 def load_event_light(

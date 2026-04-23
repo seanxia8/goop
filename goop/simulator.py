@@ -213,6 +213,7 @@ class OpticalSimulator:
         subtract_t0: bool = False,
         add_baseline_noise: bool = True,
         label_batch_size: Optional[int] = None,
+        return_tpc: bool = False,
     ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
@@ -230,11 +231,19 @@ class OpticalSimulator:
             batch.  When the number of unique labels exceeds this, they are
             processed in groups to limit GPU memory.  TOF sampling and delays
             are still computed once for all labels.
+        return_tpc : bool
+            When True and *labels* is provided, return a tuple
+            ``(waveforms, positions, n_photons, t_step, labels)`` where the
+            TPC arrays reflect all manipulations (t0 subtraction, random
+            shift, window filtering) so they can be passed directly to
+            ``save_event_light_w_tpc``.
 
         Returns
         -------
         SlicedWaveform or Waveform when *labels* is None.
-        list[SlicedWaveform] when *labels* is provided.
+        list[SlicedWaveform] when *labels* is provided and *return_tpc* is False.
+        tuple(list[SlicedWaveform], np.ndarray, np.ndarray, np.ndarray, np.ndarray)
+            when *labels* is provided and *return_tpc* is True.
         """
         cfg = self.config
         device = self._device
@@ -249,18 +258,28 @@ class OpticalSimulator:
             labels = (
                 torch.from_dlpack(labels) if not isinstance(labels, torch.Tensor) else labels
             ).to(dtype=torch.long, device=device)
-
-        if subtract_t0:
-            t_step = t_step - t_step.min()
-        
-        if labels is not None:
             unique_tpc_labels = torch.unique(labels)
 
-            if cfg.time_window_ns is not None:
-                rand_t0_per_label = torch.rand(len(unique_tpc_labels), device=labels.device) * cfg.time_window_ns
+        if subtract_t0:
+            if labels is not None:
+                # Step 1: normalise each label group so its minimum t_step is 0
                 label_indices = torch.searchsorted(unique_tpc_labels, labels)
-                rand_t0 = rand_t0_per_label[label_indices]
-                t_step += rand_t0            
+                per_label_min = torch.full(
+                    (len(unique_tpc_labels),), float("inf"), dtype=t_step.dtype, device=device
+                )
+                per_label_min.scatter_reduce_(0, label_indices, t_step, reduce="amin", include_self=True)
+                t_step = t_step - per_label_min[label_indices]
+            else:
+                t_step = t_step - t_step.min()
+
+        if labels is not None and cfg.time_window_ns is not None:
+            label_indices = torch.searchsorted(unique_tpc_labels, labels)
+            # Step 2: random per-label start time within [0, time_window_ns)
+            rand_t0_per_label = torch.rand(len(unique_tpc_labels), device=device) * cfg.time_window_ns
+            t_step = t_step + rand_t0_per_label[label_indices]
+            # Step 3: drop points that exceed the window
+            keep = t_step <= cfg.time_window_ns
+            pos, n_photons, t_step, labels = pos[keep], n_photons[keep], t_step[keep], labels[keep]
 
         # 1. TOF sampling (batched across all positions)
         times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
@@ -272,7 +291,7 @@ class OpticalSimulator:
         # Labeled mode
         if labels is not None:
             photon_labels = labels[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
-            unique_labels = torch.unique(labels)[:cfg.n_labels_to_simulate]
+            unique_labels = torch.unique(labels[labels >= 0])[:cfg.n_labels_to_simulate]
             n_labels = len(unique_labels)            
             bs = label_batch_size or n_labels
 
@@ -283,6 +302,15 @@ class OpticalSimulator:
                     times, channels, photon_labels, batch_labels,
                     stitched, add_baseline_noise,
                 ))
+
+            if return_tpc:
+                return (
+                    results,
+                    pos.cpu().numpy(),
+                    n_photons.cpu().numpy(),
+                    t_step.cpu().numpy(),
+                    labels.cpu().numpy(),
+                )
             return results
 
         # Unlabeled mode
