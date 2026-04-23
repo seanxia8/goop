@@ -26,3 +26,15 @@ def digitize(data: torch.Tensor, pedestal: float, n_bits: int) -> torch.Tensor:
     """
     adc_max = (1 << n_bits) - 1
     return (data + pedestal).round().clamp(0, adc_max)
+
+
+def digitize_ste(data: torch.Tensor, pedestal: float, n_bits: int) -> torch.Tensor:
+    """Straight-through-estimator (STE) digitization.
+
+    Forward: same as ``digitize`` — ``(data + pedestal).round().clamp(0, max)``.
+    Backward: gradient passes through to ``data`` as identity (the round and
+    clamp are bypassed in the autograd graph).
+    """
+    x = data + pedestal
+    x_q = digitize(data, pedestal, n_bits)  # round + clamp, no_grad
+    return x_q + (x - x.detach())

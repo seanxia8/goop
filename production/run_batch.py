@@ -47,6 +47,7 @@ from goop.digitize import DigitizationConfig
 from goop.sampler import create_default_tof_sampler
 from goop.io import write_config_light, save_event_light
 
+
 sys.stdout.reconfigure(line_buffering=True)
 
 
@@ -159,6 +160,7 @@ def main():
     parser.add_argument('--workers', type=int, default=2,
                         help='Number of save worker threads (0=serial, default: 2)')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--align', action='store_true', help='Requires subtract_t0=True in goop_sim.simulate()')
     args = parser.parse_args()
 
     include_digitize = not args.no_digitize
@@ -168,6 +170,7 @@ def main():
     events_per_file = args.events_per_file
     dataset_name = args.dataset
     label_key = args.label_key
+    should_align = args.align
 
     total_events = get_num_events(args.data)
     num_events = min(args.events, total_events) if args.events else total_events
@@ -250,7 +253,7 @@ def main():
     jax.block_until_ready(warmup_filled.volumes[0].charge)
     pos, nph, tns, lbl, _ = extract_goop_inputs(warmup_filled, cfg, label_key)
     warmup_wfs = goop_sim.simulate(pos, nph, tns, labels=lbl,
-                                   stitched=True, subtract_t0=False)
+                                   stitched=True, subtract_t0=True)
     del warmup_dep, warmup_filled, warmup_wfs, pos, nph, tns, lbl
     gc.collect()
     torch.cuda.empty_cache()
@@ -367,7 +370,12 @@ def main():
                         extract_goop_inputs(filled, cfg, label_key)
                     waveforms = goop_sim.simulate(
                         pos_mm, n_ph, t_ns,
-                        labels=labels, stitched=True, subtract_t0=False)
+                        labels=labels, stitched=True, subtract_t0=True)
+
+                    # 4.1 - Align Waveforms
+                    if should_align:
+                        waveforms = [wf.align() for wf in waveforms] # List[SlicedWaveform]
+                    
                     t_goop_elapsed = time.time() - t0
 
                     # Collect stats before CPU transfer

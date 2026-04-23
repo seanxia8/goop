@@ -54,6 +54,68 @@ result = sim.simulate(pos, n_photons, t_step, stitched=True)
 result.attrs["pe_counts"]  # (n_channels,) detected PE per PMT
 ```
 
+### Differentiable simulator
+
+`DifferentiableOpticalSimulator` runs the same pipeline with all gradient-blocking ops replaced or modified: all per-photon delay sampling (e.g., scintillation / TPB reemission delays) becomes a `Response` composite-kernel convolution (Scint * TPB * TTS * SER), per-photon TOF sampling becomes deterministic PDF deposition (which gives the expectation), and ADC quantization is wrapped in a straight-through estimator (`digitize_ste`).
+
+Gradients flow from `pos`, `t_step`, `n_photons` all the way through to `sw.adc` and `sw.attrs["pe_counts"]`.
+
+```python
+from goop import (
+    DifferentiableOpticalSimulator, OpticalSimConfig,
+    Response, ScintillationKernel, TPBExponentialKernel, TTSKernel, SERKernel,
+    create_default_tof_sampler,
+)
+from goop.delays import Delays
+
+device = torch.device("cuda")
+
+config = OpticalSimConfig(
+    tof_sampler=create_default_tof_sampler(device=str(device)),   # LUT sampler (see below)
+    delays=Delays([]),  # delays are now in the kernel — see below
+    kernel=Response(
+        kernels=[
+            ScintillationKernel(device=device),
+            TPBExponentialKernel(device=device),
+            TTSKernel(device=device),
+            SERKernel(duration_ns=2000.0, device=device),
+        ],
+        tick_ns=1.0, device=device,
+    ),
+    device=str(device), tick_ns=1.0, gain=-45.0,
+)
+sim = DifferentiableOpticalSimulator(config)
+
+# pos / n_photons / t_step can carry requires_grad=True
+n_photons = torch.full((n_pos,), 10_000.0, device=device, requires_grad=True)
+sw = sim.simulate(pos, n_photons, t_step, stitched=True)
+
+loss = sw.adc.pow(2).sum()
+loss.backward()           # n_photons.grad now populated
+```
+
+### TOF samplers: voxel LUT vs SIREN
+
+Every PCA-compressed TOF sampler inherits from `PCATOFSampler` (quantile-time reconstruction, Poisson + inverse-CDF `sample`, differentiable `sample_pdf`). Two concrete backends ship in `goop.sampler`:
+
+- **`TOFSampler`** (voxel LUT) — trilinear interpolation of `(vis, t0, coeffs)` from the compressed photon library. Fast on GPU but memory-heavy (the full LUT is ≈24 GB at the default 1.6 M voxels × 81 PMTs × 50 coefficients).
+- **`SirenTOFSampler`** — the LUT lookup is replaced by a pre-trained SIREN network (`sirentv.models.pca_siren.PcaSiren`) that predicts `(vis, log_t0, coeffs)` in the *same* PCA basis. Keeps the entire lookup differentiable end-to-end (gradients flow through the network back to input positions), with essentially constant memory and wall-clock cost similar to the LUT in practice.
+
+Both factories default to the standard photon library at `/sdf/data/neutrino/youngsam/compressed_plib_b04_quantile_log_n50.h5`:
+
+```python
+from goop import create_default_tof_sampler, create_siren_tof_sampler
+
+# LUT — trilinear-interp lookup from the compressed plib
+lut = create_default_tof_sampler(device="cuda:0")
+
+# SIREN — neural lookup; ckpt/cfg/plib defaults point at version-67 epoch-2000
+siren = create_siren_tof_sampler(device="cuda:0")
+
+# Swap either into the simulator config
+config = OpticalSimConfig(tof_sampler=siren, ...)
+```
+
 ### Per-label waveforms
 
 Split output by any per-position grouping (detector volume, interaction ID, etc.). TOF sampling and delays are batched; the rest of the pipeline runs in a single call via virtual-channel remapping, then the combined waveform is split by label.
@@ -233,22 +295,27 @@ See [`notebooks/minimal_example.ipynb`](notebooks/minimal_example.ipynb) for a c
 
 ```
 goop/
-    simulator.py      OpticalSimConfig, OpticalSimulator
-    waveform.py       Waveform, SlicedWaveform
-    waveform_utils.py helper functions (slicing, FFT utilities)
-    kernels.py        RLCKernel, SERKernel (impulse response models)
-    delays.py         ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
-    noise.py          DarkNoise (auxiliary photon sources)
-    digitize.py       DigitizationConfig, digitize (ADC quantization)
-    sampler.py        TOFSampler (PCA-compressed photon library)
-    io.py             HDF5 save/load for per-volume SlicedWaveforms
-    base.py           abstract base classes
+    simulator.py       OpticalSimConfig, OpticalSimulator
+    diff_simulator.py  DifferentiableOpticalSimulator
+    waveform.py        Waveform, SlicedWaveform
+    waveform_utils.py  helper functions (slicing, FFT utilities)
+    kernels.py         RLCKernel, SERKernel, ScintillationKernel, TPBExponentialKernel,
+                       TPBTriexponentialKernel, TTSKernel, Response (composite via FFT)
+    delays.py          ScintillationBiexponentialDelay, TPBExponentialDelay, TTSDelay
+    noise.py           DarkNoise (auxiliary photon sources)
+    digitize.py        DigitizationConfig, digitize, digitize_ste (STE for backprop)
+    sampler/
+        base.py        PCATOFSampler (shared PCA reconstruction + sample / sample_pdf)
+        lut.py         TOFSampler, DifferentiableTOFSampler (voxel LUT lookup)
+        siren.py       SirenTOFSampler (pre-trained SIREN network lookup)
+    io.py              HDF5 save/load for per-volume SlicedWaveforms
+    base.py            abstract base classes
 ```
 
 ## Tests
 
 ```bash
-python -m pytest test_simulator.py -v
+python -m pytest tests/ -v
 ```
 
 ## TODO
