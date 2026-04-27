@@ -215,6 +215,8 @@ class OpticalSimulator:
         n_photons: ArrayLike,
         t_step: ArrayLike,
         labels: Optional[ArrayLike] = None,
+        pdgs: Optional[ArrayLike] = None,
+        de: Optional[ArrayLike] = None,
         stitched: bool = True,
         subtract_t0: bool = False,
         add_baseline_noise: bool = True,
@@ -258,9 +260,18 @@ class OpticalSimulator:
             torch.from_dlpack(a) if not isinstance(a, torch.Tensor) else a
             for a in (pos, n_photons, t_step)
         )
+        if pdgs is not None:
+            pdgs = torch.from_dlpack(pdgs) if not isinstance(pdgs, torch.Tensor) else pdgs
+        if de is not None:
+            de = torch.from_dlpack(de) if not isinstance(de, torch.Tensor) else de
         pos = pos.to(device=device, dtype=torch.float32)
         n_photons = n_photons.to(device=device)
         t_step = t_step.to(device=device, dtype=torch.float32)
+        if pdgs is not None:
+            pdgs = pdgs.to(device=device, dtype=torch.float32)
+        if de is not None:
+            de = de.to(device=device, dtype=torch.float32)
+
 
         if labels is not None:
             labels = (
@@ -299,6 +310,7 @@ class OpticalSimulator:
             # Step 3: drop valid-label points that exceed the window; always keep label=-1.
             keep = valid_mask & (t_step <= cfg.time_window_ns)
             pos_masked, n_photons_masked, t_step_masked, labels_masked = pos[keep], n_photons[keep], t_step[keep], labels[keep]
+            pdgs_masked, de_masked = pdgs[keep], de[keep]
             times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
 
         else:
@@ -306,6 +318,7 @@ class OpticalSimulator:
             times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
             # No time-window filter: all valid positions are "kept".
             pos_masked, n_photons_masked, t_step_masked = pos, n_photons, t_step
+            pdgs_masked, de_masked = pdgs, de
             labels_masked = labels if labels is not None else None
 
         # 2. Stochastic delays
@@ -338,12 +351,15 @@ class OpticalSimulator:
                 # Keep only TPC points whose label was actually simulated,
                 # so the returned arrays align 1-to-1 with `results`.
                 sim_mask = torch.isin(labels_masked, unique_labels_to_simulate)
+                pdgs_masked, de_masked = pdgs_masked[sim_mask], de_masked[sim_mask]
                 return (
                     results,
                     pos_masked[sim_mask].cpu().numpy(),
                     n_photons_masked[sim_mask].cpu().numpy(),
                     t_step_masked[sim_mask].cpu().numpy(),
                     labels_masked[sim_mask].cpu().numpy(),
+                    pdgs_masked.cpu().numpy(),
+                    de_masked.cpu().numpy(),
                 )
             return results
 
