@@ -315,10 +315,12 @@ class TestEdgeCases:
             torch.zeros(0), torch.zeros(0, dtype=torch.long),
             tick_ns=1.0, n_channels=2, kernel_extent_ns=470.0,
         )
-        assert sw.n_chunks == 2  # one trivial chunk per empty channel
+        assert sw.n_chunks == 0  # no photons → no chunks (inactive channels are not stored)
         assert sw.n_channels == 2
         wf = sw.deslice()
         assert isinstance(wf, Waveform)
+        # Inactive channels deslice to a single fill bin per channel.
+        assert wf.adc.shape == (2, 1)
 
     def test_sliced_from_photons_single_photon_per_channel(self):
         sw = SlicedWaveform.from_photons(

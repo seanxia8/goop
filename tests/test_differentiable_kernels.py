@@ -469,6 +469,7 @@ class TestGradients:
         cfg = OpticalSimConfig(
             tof_sampler=sampler, delays=Delays([]), kernel=response,
             device="cpu", tick_ns=1.0, gain=-1.0,
+            streaming=False,   # _SeededTOF mock only exposes sample_pdf, not histogram_pdf
         )
         sim = DifferentiableOpticalSimulator(cfg)
         out = sim.simulate(
@@ -494,6 +495,7 @@ def _minimal_cfg(**overrides) -> OpticalSimConfig:
         delays=Delays([]),
         kernel=create_default_response(device=DEVICE),
         device="cpu", tick_ns=1.0, gain=-1.0,
+        streaming=False,   # _SeededTOF mock only exposes sample_pdf, not histogram_pdf
     )
     base.update(overrides)
     return OpticalSimConfig(**base)

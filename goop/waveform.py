@@ -241,10 +241,6 @@ class SlicedWaveform:
             ch_times = times[ch_mask]
 
             if ch_times.numel() == 0:
-                all_adc.append(torch.zeros(1, device=device))
-                offsets_list.append(offsets_list[-1] + 1)
-                all_t0.append(default_t0)
-                all_pmt.append(ch)
                 continue
 
             sort_idx = ch_times.sort().indices
@@ -338,7 +334,6 @@ class SlicedWaveform:
         dst_ch = self.pmt_id[k]
         flat_dst = dst_ch * n_bins + dst_bin.clamp(0, n_bins - 1)
 
-        # Single fused scatter — differentiable (backward = gather).
         data = torch.full(
             (self.n_channels * n_bins,), fill, device=device, dtype=torch.float32
         )
@@ -475,33 +470,14 @@ class SlicedWaveform:
         )
     
     def align(sw: SlicedWaveform, fill: float = 0.0) -> SlicedWaveform:
-        """Rewrites each active channel in `sw` as a single chunk spanning the global
-        [min_t0, max_t_end] window, padding gaps with `fill`. Placeholder chunks
-        (t0=0.0 with a zero adc first bin) are excluded from the window calculation.
+        """Rewrite each active channel as a single chunk spanning the global
+        ``[min_t0, max_t_end]`` window, padding gaps with `fill`. 
         """
-        
+
         device = sw.adc.device
         chunk_lengths = sw.offsets[1:] - sw.offsets[:-1]
 
-        # Exclude chunks with t0=0 when clear real activity exists elsewhere.
-        # This handles both explicit placeholders and channels with no photons
-        # that were assigned t0=0 by any construction path.
-        # Filtering by ADC as well
-        nonzero_mask = sw.t0_ns > 0.0
-        if nonzero_mask.any():
-            min_nonzero_t0 = sw.t0_ns[nonzero_mask].min()
-
-            # Check only the first bin of each chunk
-            first_bin_vals = sw.adc[sw.offsets[:-1]]
-
-            # Placeholder: t0 below real activity threshold AND first bin is zero
-            is_placeholder = (sw.t0_ns < min_nonzero_t0) & (first_bin_vals == 0.0)
-        else:
-            is_placeholder = torch.zeros(sw.n_chunks, device=device, dtype=torch.bool)
-
-        active = torch.where(~is_placeholder)[0]
-
-        if active.numel() == 0:
+        if sw.n_chunks == 0:
             return SlicedWaveform(
                 adc=torch.zeros(0, device=device, dtype=torch.float32),
                 offsets=torch.zeros(1, device=device, dtype=torch.long),
@@ -513,38 +489,28 @@ class SlicedWaveform:
                 attrs=dict(sw.attrs),
             )
 
-        active_channels = torch.unique(sw.pmt_id[active])
+        active_channels = torch.unique(sw.pmt_id)
         active_channels_list = active_channels.tolist()
         n_active_ch = active_channels.numel()
 
-        # Per-channel earliest start and latest end, then take global extremes
-        ch_t0_list = []
-        ch_t_end_list = []
-        for ch in active_channels_list:
-            ch_active = active[sw.pmt_id[active] == ch]
-            ch_t0 = sw.t0_ns[ch_active].min().item()
-            ch_t_end = (sw.t0_ns[ch_active] + chunk_lengths[ch_active].float() * sw.tick_ns).max().item()
-            ch_t0_list.append(ch_t0)
-            ch_t_end_list.append(ch_t_end)
-
-        t0_global = min(ch_t0_list)
-        t_end_global = max(ch_t_end_list)
+        # Global window from chunk extents.
+        chunk_t_ends = sw.t0_ns + chunk_lengths.float() * sw.tick_ns
+        t0_global = sw.t0_ns.min().item()
+        t_end_global = chunk_t_ends.max().item()
         n_bins_global = max(1, int(round((t_end_global - t0_global) / sw.tick_ns)))
 
-        # Pre-filled with `fill`. left-pad comes from r0 offset, right-pad is implicit
+        # Pre-filled with `fill`; per-chunk slices below overwrite the active span.
         new_adc = torch.full(
             (n_active_ch * n_bins_global,), fill, device=device, dtype=torch.float32
         )
 
         for i, ch in enumerate(active_channels_list):
-            ch_active = active[sw.pmt_id[active] == ch]
+            ch_chunks = (sw.pmt_id == ch).nonzero(as_tuple=True)[0]
             row = new_adc[i * n_bins_global : (i + 1) * n_bins_global]
-            for k in ch_active.tolist():
+            for k in ch_chunks.tolist():
                 chunk_data = sw.adc[sw.offsets[k] : sw.offsets[k + 1]]
-                # r0 is offset from the global t0, giving left-padding for late-starting channels
                 r0 = int(round((sw.t0_ns[k].item() - t0_global) / sw.tick_ns))
-                chunk_len = chunk_data.numel()
-                end = min(r0 + chunk_len, n_bins_global)
+                end = min(r0 + chunk_data.numel(), n_bins_global)
                 if end > r0:
                     row[r0:end] = chunk_data[: end - r0]
 

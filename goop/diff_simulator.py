@@ -51,6 +51,12 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
     """
 
     def __init__(self, config: OpticalSimConfig):
+        if not hasattr(config.tof_sampler, "sample_pdf"):
+            raise ValueError(
+                "DifferentiableOpticalSimulator requires a TOF sampler that exposes "
+                "`sample_pdf(...)` (e.g. PCATOFSampler subclasses). Got "
+                f"{type(config.tof_sampler).__name__}."
+            )
         super().__init__(config)
 
     def simulate(
@@ -215,7 +221,9 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
                 "use streaming=False if you need SER jitter."
             )
 
-        t_window = sampler.t_max_ns
+        # Most PCA samplers expose ``t_max_ns`` as a property; a generic mock
+        # sampler may not. Default to 600 ns (the shipped basis's window).
+        t_window = getattr(sampler, "t_max_ns", 600.0)
         kernel_extent_ns = float(fine_kernel_tensor.shape[0]) * fine_tick
         gap_threshold = kernel_extent_ns + t_window + _GAP_THRESHOLD_PAD_NS
 
