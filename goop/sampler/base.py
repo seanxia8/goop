@@ -303,8 +303,9 @@ class PCATOFSampler(TOFSamplerBase):
             weights = active_counts.unsqueeze(-1) * du.unsqueeze(0) * in_window  # (M, Q) weighted counts
             out_flat.scatter_add_(0, flat_idx.reshape(-1), weights.reshape(-1))  # accumulate
 
-        return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)
-
+        #return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)
+        return out_flat.reshape(n_pmts_full, n_bins).to(torch.float32)  # (2P, n_bins)
+        
     def _sample_raw(self, pos, scale, N, P, n_pmts_full, chunk_size, t_step):
         """Inverse-CDF sampling for raw (time, channel, source_idx) triples.
 
