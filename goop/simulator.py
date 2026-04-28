@@ -190,9 +190,10 @@ class OpticalSimulator:
 
         # Per-label aux sources in virtual channel space
         if cfg.aux_photon_sources and b_times.numel() > 0:
+            b_times_real = b_times  # snapshot before aux sources grow b_times
             for li in range(n_batch):
                 lbl_mask = b_photon_labels == batch_labels[li]
-                lbl_t = b_times[lbl_mask]
+                lbl_t = b_times_real[lbl_mask]
                 if lbl_t.numel() == 0:
                     continue
                 t_start, t_end = lbl_t.min().item(), lbl_t.max().item()
