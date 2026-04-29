@@ -314,24 +314,14 @@ class PCATOFSampler(TOFSamplerBase):
                 active_t_emit = t_expanded[has_photon]               # (M,)
                 q_abs = q_abs + active_t_emit.unsqueeze(-1)          # (M, Q) shift by emission time
 
-            # Per-cell Poisson sampling: each (pair, q-bin) is an independent
-            # Poisson with rate expected[m] * du[q]. Sum over q gives Poisson(
-            # expected[m]) per pair (sum-of-independent-Poissons property), so
-            # the per-pair total has the same distribution as a single
-            # Poisson(expected) draw — but the spatial structure across bins
-            # is now physical (each photon is an independent event), and
-            # counts are integer at every cell so no truncation step is needed.
-            rate_mq = active_expected.unsqueeze(-1) * du.unsqueeze(0)   # (M, Q)
-            counts_mq = torch.poisson(rate_mq).long()                   # (M, Q) integer counts
-
             # convert quantile times to histogram bins and scatter-add
             bin_idx = (q_abs * inv_tick).long()                      # (M, Q) time bin indices
             in_window = (bin_idx >= 0) & (bin_idx < n_bins)          # (M, Q) bool
             bin_idx.clamp_(0, n_bins - 1)                            # (M, Q) clamped
             flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx   # (M, Q) flat dst index
-            counts_mq = counts_mq * in_window                        # zero out-of-window counts
             out_flat.scatter_add_(
-                0, flat_idx.reshape(-1), counts_mq.reshape(-1).to(out_flat.dtype),
+                0, flat_idx.reshape(-1),
+                (counts_q * in_window).reshape(-1).to(out_flat.dtype),
             )
 
         return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)

@@ -17,7 +17,6 @@ from .sampler import create_default_tof_sampler
 from .delays import Delays, create_default_delays
 from .kernels import create_default_kernel
 from .waveform import SlicedWaveform, Waveform
-from .utils import voxelize
 
 @dataclass
 class OpticalSimConfig:
@@ -47,7 +46,6 @@ class OpticalSimConfig:
     stream_checkpoint: bool = True    # per-chunk gradient checkpoint in histogram_pdf;
                                        # disable for small N (e.g. after voxelization)
 
-    voxel_size_mm: float = 10.0 # mm
 
     def __post_init__(self):
         if not isinstance(self.oversample, int) or self.oversample < 1:
@@ -237,7 +235,6 @@ class OpticalSimulator:
         add_baseline_noise: bool = True,
         label_batch_size: Optional[int] = None,
         return_tpc: bool = False,
-        do_voxelize: bool = False,
     ) -> Union[SlicedWaveform, Waveform, List[SlicedWaveform]]:
         """
         Run the full optical simulation pipeline.
@@ -326,20 +323,13 @@ class OpticalSimulator:
             # Step 3: drop valid-label points that exceed the window; always keep label=-1.
             keep = valid_mask & (t_step <= cfg.time_window_ns)
             pos_masked, n_photons_masked, t_step_masked, labels_masked = pos[keep], n_photons[keep], t_step[keep], labels[keep]
-            pdgs_masked, de_masked = pdgs[keep], de[keep]
-            if do_voxelize:
-                pos_vox, n_photons_vox, t_step_vox = voxelize(pos_masked, n_photons_masked, t_step_masked, dx=cfg.voxel_size_mm)
-                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
-            else:
-                times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
+            pdgs_masked = pdgs[keep] if pdgs is not None else None
+            de_masked = de[keep] if de is not None else None
+            times, channels, source_idx = cfg.tof_sampler.sample(pos_masked, n_photons_masked, t_step=t_step_masked)
 
         else:
             # 1. TOF sampling (batched across all positions)
-            if do_voxelize:
-                pos_vox, n_photons_vox, t_step_vox = voxelize(pos, n_photons, t_step, dx=cfg.voxel_size_mm)
-                times, channels, source_idx = cfg.tof_sampler.sample(pos_vox, n_photons_vox, t_step=t_step_vox)
-            else:
-                times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
+            times, channels, source_idx = cfg.tof_sampler.sample(pos, n_photons, t_step=t_step)
             # No time-window filter: all valid positions are "kept".
 
             pdgs_masked, de_masked = pdgs, de
@@ -371,7 +361,7 @@ class OpticalSimulator:
             sliced_results: List[SlicedWaveform] = []
             for start in range(0, n_labels, bs):
                 batch_labels = unique_labels_to_simulate[start:start + bs]
-                results.extend(self._simulate_labeled_batch(
+                sliced_results.extend(self._simulate_labeled_batch(
                     times, channels, photon_labels, batch_labels,
                 ))
 
@@ -389,15 +379,18 @@ class OpticalSimulator:
                 # Keep only TPC points whose label was actually simulated,
                 # so the returned arrays align 1-to-1 with `results`.
                 sim_mask = torch.isin(labels_masked, unique_labels_to_simulate)
-                pdgs_masked, de_masked = pdgs_masked[sim_mask], de_masked[sim_mask]
+                pdgs_out = (pdgs_masked[sim_mask].cpu().numpy()
+                            if pdgs_masked is not None else None)
+                de_out = (de_masked[sim_mask].cpu().numpy()
+                          if de_masked is not None else None)
                 return (
                     results,
                     (pos_masked[sim_mask]).cpu().numpy(),
                     (n_photons_masked[sim_mask]).cpu().numpy(),
                     (t_step_masked[sim_mask]).cpu().numpy(),
                     (labels_masked[sim_mask]).cpu().numpy(),
-                    (pdgs_masked).cpu().numpy(),
-                    (de_masked).cpu().numpy(),
+                    pdgs_out,
+                    de_out,
                 )
             return results
 
