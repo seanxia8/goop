@@ -43,7 +43,6 @@ class OpticalSimConfig:
     time_window_ns: Optional[float] = None
 
     # for diff-sim
-    streaming: bool = True
     stream_chunk_size: int = 5000
     stream_checkpoint: bool = True    # per-chunk gradient checkpoint in histogram_pdf;
                                        # disable for small N (e.g. after voxelization)
@@ -75,12 +74,14 @@ class OpticalSimulator:
         self,
         times: torch.Tensor,
         channels: torch.Tensor,
-        stitched: bool,
         *,
         n_channels: Optional[int] = None,
-        add_baseline_noise: bool = True,
-    ) -> Union[SlicedWaveform, Waveform]:
-        """Histogram → SER jitter → convolve → downsample → noise → digitize.
+    ) -> SlicedWaveform:
+        """Histogram → SER jitter → convolve. Returns a `SlicedWaveform`
+        at the *fine* tick (`self._fine_tick`) — downsampling, baseline
+        noise, and digitization are applied by the public `simulate`
+        entry point so they operate on the user-facing output (sliced or
+        dense depending on `stitched`).
 
         Aux photon sources must be injected into *times*/*channels* by the
         caller before this method is called.
@@ -93,10 +94,13 @@ class OpticalSimulator:
         if n_channels is None:
             n_channels = cfg.n_channels
 
-        wvfm_cls = SlicedWaveform if stitched else Waveform
-        extra_args: dict = {}
-        if stitched:
-            extra_args["kernel_extent_ns"] = fine_kernel_tensor.shape[0] * fine_tick
+        extra_args: dict = {
+            "kernel_extent_ns": fine_kernel_tensor.shape[0] * fine_tick,
+        }
+        # When oversampling, snap each chunk's t0 to the *output* (coarse)
+        # tick. This keeps sliced.downsample numerically equivalent to
+        # deslice→dense.downsample by ensuring per-chunk averaging windows
+        # align with the coarse grid (no aliasing across chunk boundaries).
         if cfg.oversample > 1:
             extra_args["t0_snap_ns"] = cfg.tick_ns
         if cfg.ser_jitter_std > 0 and times.numel() > 0:
@@ -109,19 +113,26 @@ class OpticalSimulator:
         else:
             pe_counts = torch.zeros(n_channels, device=device, dtype=torch.long)
 
-        wf = wvfm_cls.from_photons(times, channels, fine_tick, n_channels, **extra_args)
+        wf = SlicedWaveform.from_photons(times, channels, fine_tick, n_channels, **extra_args)
         wf.attrs["pe_counts"] = pe_counts
-
         wf = wf.convolve(fine_kernel_tensor, cfg.gain)
+        return wf
+
+    def _finalize(self, wf, add_baseline_noise: bool):
+        """Downsample + baseline noise + digitization. Works on either a
+        `SlicedWaveform` or a dense `Waveform` (operates on `wf.adc`).
+        Downsample on a dense buffer averages on a single global window,
+        which is strictly more accurate at chunk boundaries than per-chunk
+        averaging — that's why dense outputs go through `deslice` first.
+        """
+        cfg = self.config
         if cfg.oversample > 1:
             wf = wf.downsample(cfg.oversample)
-
         if add_baseline_noise and cfg.baseline_noise_std > 0:
-            wf.adc += torch.randn_like(wf.adc) * cfg.baseline_noise_std
+            wf.adc = wf.adc + torch.randn_like(wf.adc) * cfg.baseline_noise_std
         if cfg.digitization is not None:
             wf = wf.digitize(cfg.digitization.pedestal, cfg.digitization.n_bits)
             wf.attrs["pedestal"] = cfg.digitization.pedestal
-
         return wf
 
     @staticmethod
@@ -172,8 +183,6 @@ class OpticalSimulator:
         channels: torch.Tensor,
         photon_labels: torch.Tensor,
         batch_labels: torch.Tensor,
-        stitched: bool,
-        add_baseline_noise: bool,
     ) -> List[SlicedWaveform]:
         """Run the virtual-channel pipeline for a batch of labels."""
         cfg = self.config
@@ -206,9 +215,11 @@ class OpticalSimulator:
                         b_times = torch.cat([b_times, aux_t])
                         virtual_channels = torch.cat([virtual_channels, li * n_ch + aux_ch])
 
+        # _simulate convolve; downsample + noise + digitize
+        # are applied per-output (sliced or desliced) by the public dispatcher
+        # after _split_by_label has run.
         combined = self._simulate(
-            b_times, virtual_channels, stitched,
-            n_channels=n_ch * n_batch, add_baseline_noise=add_baseline_noise,
+            b_times, virtual_channels, n_channels=n_ch * n_batch,
         )
         return self._split_by_label(combined, n_ch, batch_labels)
 
@@ -238,18 +249,18 @@ class OpticalSimulator:
             provided, photon channels are remapped into disjoint virtual
             channel spaces (one per label) so the entire pipeline runs in
             a single batched call.  The combined waveform is then split
-            back into per-label ``SlicedWaveform`` objects.
+            back into per-label `SlicedWaveform` objects.
         label_batch_size : optional int
             Maximum number of unique labels to process in one virtual-channel
             batch.  When the number of unique labels exceeds this, they are
-            processed in groups to limit GPU memory.  TOF sampling and delays
+            processed in batches to limit GPU memory.  TOF sampling and delays
             are still computed once for all labels.
         return_tpc : bool
             When True and *labels* is provided, return a tuple
-            ``(waveforms, positions, n_photons, t_step, labels)`` where the
+            `(waveforms, positions, n_photons, t_step, labels)` where the
             TPC arrays reflect all manipulations (t0 subtraction, random
             shift, window filtering) so they can be passed directly to
-            ``save_event_light_w_tpc``.
+            `save_event_light_w_tpc`.
 
         Returns
         -------
@@ -337,6 +348,12 @@ class OpticalSimulator:
         if times.numel() > 0:
             times = times + cfg.delays.sample(times.shape[0], device)
 
+        # Per-bin "fill" for inactive bins after deslice — pedestal if
+        # digitization is configured, 0 otherwise — so dense buffers receive
+        # realistic baseline noise on inactive bins.
+        deslice_fill = (
+            float(cfg.digitization.pedestal) if cfg.digitization is not None else 0.0
+        )
         # Labeled mode — choose which labels to generate waveforms for.
         # This is done *after* t_step preprocessing so the subset selection
         # does not corrupt the normalisation of non-simulated labels.
@@ -351,13 +368,22 @@ class OpticalSimulator:
             photon_labels = labels_masked[source_idx] if times.numel() > 0 else torch.empty(0, dtype=torch.long, device=device)
             n_labels = len(unique_labels_to_simulate)
             bs = label_batch_size or n_labels
-            results: List[SlicedWaveform] = []
+            sliced_results: List[SlicedWaveform] = []
             for start in range(0, n_labels, bs):
                 batch_labels = unique_labels_to_simulate[start:start + bs]
                 results.extend(self._simulate_labeled_batch(
                     times, channels, photon_labels, batch_labels,
-                    stitched, add_baseline_noise,
                 ))
+
+            if stitched:
+                results = [
+                    self._finalize(sw, add_baseline_noise) for sw in sliced_results
+                ]
+            else:
+                results = [
+                    self._finalize(sw.deslice(fill=deslice_fill), add_baseline_noise)
+                    for sw in sliced_results
+                ]
 
             if return_tpc:
                 # Keep only TPC points whose label was actually simulated,
@@ -384,4 +410,9 @@ class OpticalSimulator:
                     times = torch.cat([times, aux_t])
                     channels = torch.cat([channels, aux_ch])
 
-        return self._simulate(times, channels, stitched, add_baseline_noise=add_baseline_noise)
+        sw = self._simulate(times, channels)
+        if stitched:
+            return self._finalize(sw, add_baseline_noise)
+        else:
+            wf = sw.deslice(fill=deslice_fill)
+            return self._finalize(wf, add_baseline_noise)

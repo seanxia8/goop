@@ -1,22 +1,22 @@
 """Differentiable optical-simulation pipeline.
 
 Replaces stochastic per-photon delay sampling with deterministic convolution
-against a composite ``Response`` kernel that includes the delay PDFs, and
+against a composite `Response` kernel that includes the delay PDFs, and
 replaces stochastic per-photon TOF sampling with a deterministic PDF
-deposition via ``DifferentiableTOFSampler.sample_pdf``.
+deposition via `DifferentiableTOFSampler.sample_pdf`.
 
 Required config
 ---------------
-- ``cfg.kernel`` is a ``Response`` (or any ``ConvolutionKernelBase``) that
+- `cfg.kernel` is a `Response` (or any `ConvolutionKernelBase`) that
   already encodes the delay PDFs the user wants — typically
-  ``create_default_response()``.
-- ``cfg.tof_sampler`` exposes a ``sample_pdf(...)`` method
-  (e.g. ``DifferentiableTOFSampler``).
+  `create_default_response()`.
+- `cfg.tof_sampler` exposes a `sample_pdf(...)` method
+  (e.g. `DifferentiableTOFSampler`).
 """
 
 from __future__ import annotations
 
-from typing import Any, Optional, Union
+from typing import Any, List, Union
 
 import torch
 
@@ -31,12 +31,41 @@ _GAP_THRESHOLD_PAD_NS = 100.0  # safety margin so a gap-split can't bisect a ker
 _N_BINS_GROUP_PAD = 10         # extra bins so late photons aren't truncated by integer rounding
 
 
-def as_dlpack(tensor: ArrayLike) -> torch.Tensor:
-    """Convert a __dlpack__-supporting array to a torch.Tensor, no-op if already one.
+def time_group_segments(
+    t_step: torch.Tensor, gap_threshold_ns: float
+) -> List[torch.Tensor]:
+    """Split a list of segment `t_step` values into groups localized in time.
 
-    Note: ``torch.from_dlpack`` fails on tensors that require_grad, so we
-    must short-circuit on torch.Tensor inputs to preserve the autograd graph.
+    Sorts segments by `t_step` and splits at any gap larger than
+    `gap_threshold_ns`. Each returned tensor is a list of indices into the
+    original `t_step` array;
+
+    Used by `DifferentiableOpticalSimulator._simulate` to bound autograd
+    memory: each time-group is histogrammed + convolved + checkpointed
+    independently, so the per-group `(M, Q)` ghost-photon transients never
+    accumulate to `(N·P, Q)` across the full event.
+
+    The stochastic `OpticalSimulator` does *not* call this — it samples
+    categorically across all segments in one pass and then chunks the
+    resulting per-channel *photon arrivals* via `SlicedWaveform.from_photons`'s
+    gap-detection. Both simulators produce a `SlicedWaveform`, but cluster
+    activity at different stages of the pipeline (pre-emission segments here,
+    post-emission per-channel arrivals there).
+
+    Note: `time_groups` (input segments, this helper) and `chunks`
+    (entries on the output `SlicedWaveform`) are different concepts —
+    typically one time-group produces `n_active_PMTs` chunks.
     """
+    if t_step.numel() == 0:
+        return []
+    order = t_step.detach().argsort()
+    t_sorted = t_step[order].detach()
+    gaps = torch.diff(t_sorted)
+    split_points = (gaps > gap_threshold_ns).nonzero(as_tuple=True)[0] + 1
+    return list(torch.tensor_split(order, split_points.cpu()))
+
+
+def as_dlpack(tensor: ArrayLike) -> torch.Tensor:
     if isinstance(tensor, torch.Tensor):
         return tensor
     return torch.from_dlpack(tensor)
@@ -45,162 +74,47 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
     """OpticalSimulator with stochastic delays replaced by kernel convolution.
 
     The delay PDFs (Scintillation, TPB, TTS) must already be folded into
-    ``config.kernel`` — typically a ``Response`` composite.  Instead of
+    `config.kernel` — typically a `Response` composite.  Instead of
     drawing per-photon delays, the photon histogram is convolved with the
     full delay-and-detector response in a single FFT pass.
+
+    All other stochastic operations are not allowed, with the exception of
+    the digitization step.
     """
 
     def __init__(self, config: OpticalSimConfig):
+        if not hasattr(config.tof_sampler, "sample_pdf"):
+            raise ValueError(
+                "DifferentiableOpticalSimulator requires a TOF sampler that exposes "
+                "`sample_pdf(...)` (e.g. PCATOFSampler subclasses). Got "
+                f"{type(config.tof_sampler).__name__}."
+            )
         super().__init__(config)
 
     def simulate(
         self,
-        pos: ArrayLike,
-        n_photons: ArrayLike,
-        t_step: ArrayLike,
+        pos: torch.Tensor,
+        n_photons: torch.Tensor,
+        t_step: torch.Tensor,
         stitched: bool = True,
         subtract_t0: bool = False,
         add_baseline_noise: bool = True,
-    ) -> SlicedWaveform:
-        """Run the deterministic PDF-deposition pipeline through the diff
-        TOF sampler and the composite ``Response`` kernel.
+    ) -> Union[SlicedWaveform, Waveform]:
+        """Group segments by time proximity, build a
+        small dense histogram per group via `histogram_pdf` (checkpoint-ed),
+        convolve each with a small FFT, and assemble into a `SlicedWaveform`.
 
-        ``stitched`` must be ``True`` (SlicedWaveform output).  Labeled mode
-        is not supported here — the PDF-deposition path doesn't track
-        per-photon source positions.
+        Peak memory is independent of both `N` (segment count, via
+        per-chunk checkpointing inside `histogram_pdf`) and total event
+        time span (via time-grouping + per-group FFTs instead of one
+        monolithic FFT).
         """
-        if not stitched:
-            raise ValueError(
-                "DifferentiableOpticalSimulator.simulate(..., stitched=False) is "
-                "not supported."
-            )
-        cfg = self.config
-        device = self._device
-
         # auto-convert any array supporting __dlpack__ to torch.Tensor
         pos, n_photons, t_step = map(as_dlpack, (pos, n_photons, t_step))
 
         if subtract_t0:
             t_step = t_step - t_step.min()
 
-        if cfg.streaming:
-            return self._simulate_streaming(
-                pos, n_photons, t_step, add_baseline_noise=add_baseline_noise
-            )
-
-        times, channels, weights = cfg.tof_sampler.sample_pdf(
-            pos, n_photons, t_step=t_step
-        )
-
-        # Inject auxiliary photon sources (e.g. DarkNoise) with unit weights.
-        # Dark hits are independent of (pos, n_photons), so they don't
-        # interfere with the gradient path back to those inputs.
-        if cfg.aux_photon_sources and times.numel() > 0:
-            t_start, t_end = times.min().item(), times.max().item()
-            for source in cfg.aux_photon_sources:
-                aux_t, aux_ch = source.sample(cfg.n_channels, t_start, t_end, device)
-                if aux_t.numel() > 0:
-                    times = torch.cat([times, aux_t])
-                    channels = torch.cat([channels, aux_ch])
-                    weights = torch.cat([weights, torch.ones_like(aux_t)])
-
-        return self._simulate(
-            times, channels, stitched, add_baseline_noise=add_baseline_noise,
-            weights=weights,
-        )
-
-    def _simulate(
-        self,
-        times: torch.Tensor,
-        channels: torch.Tensor,
-        stitched: bool,
-        *,
-        n_channels: Optional[int] = None,
-        add_baseline_noise: bool = True,
-        weights: Optional[torch.Tensor] = None,
-    ) -> SlicedWaveform:
-        """Histogram (with PDF weights, optional SER jitter) → convolve →
-        downsample → baseline noise.
-
-        ``weights`` carries the per-synthetic-photon probability mass from
-        ``sample_pdf`` (plus unit weights from any aux photon sources);
-        gradients flow through it to ``n_photons`` and, via the trilinear
-        voxel interpolation, to ``pos``.
-
-        Optional noise:
-        - SER jitter (``ser_jitter_std > 0``): multiplies weights by
-          ``N(1, σ)`` per photon — the random factor is a constant in the
-          autograd graph, so gradient through ``weights`` is preserved.
-        - Baseline noise (``baseline_noise_std > 0`` and
-          ``add_baseline_noise=True``): adds ``N(0, σ)`` per ADC bin —
-          additive constant, preserves all gradients.
-
-        Digitization is rejected at construction time.
-        """
-        cfg = self.config
-        device = self._device
-        fine_tick = self._fine_tick
-        fine_kernel_tensor = self._fine_kernel()
-        if n_channels is None:
-            n_channels = cfg.n_channels
-
-        if cfg.ser_jitter_std > 0 and weights.numel() > 0:
-            jitter = torch.normal(
-                1.0, cfg.ser_jitter_std, weights.shape, device=device
-            )
-            weights = weights * jitter
-
-        wvfm_cls = SlicedWaveform if stitched else Waveform
-        extra_args: dict = {"weights": weights}
-        if stitched:
-            extra_args["kernel_extent_ns"] = fine_kernel_tensor.shape[0] * fine_tick
-        if cfg.oversample > 1:
-            extra_args["t0_snap_ns"] = cfg.tick_ns
-
-        if times.numel() > 0:
-            pe_counts = torch.zeros(n_channels, device=device, dtype=torch.float32)
-            pe_counts = pe_counts.scatter_add(0, channels.long(), weights)
-        else:
-            pe_counts = torch.zeros(n_channels, device=device, dtype=torch.float32)
-
-        wf = wvfm_cls.from_photons(times, channels, fine_tick, n_channels, **extra_args)
-        wf.attrs["pe_counts"] = pe_counts
-
-        wf = wf.convolve(fine_kernel_tensor, cfg.gain)
-        if cfg.oversample > 1:
-            wf = wf.downsample(cfg.oversample)
-
-        if add_baseline_noise and cfg.baseline_noise_std > 0:
-            wf.adc = wf.adc + torch.randn_like(wf.adc) * cfg.baseline_noise_std
-
-        if cfg.digitization is not None:
-            # STE: forward applies round+clamp; backward passes gradient
-            # through as identity.  Biased gradient (true gradient is zero
-            # almost everywhere), but useful for training.
-            wf.adc = digitize_ste(
-                wf.adc, cfg.digitization.pedestal, cfg.digitization.n_bits,
-            )
-            wf.attrs["pedestal"] = cfg.digitization.pedestal
-        return wf
-
-
-    def _simulate_streaming(
-        self,
-        pos: torch.Tensor,
-        n_photons: torch.Tensor,
-        t_step: torch.Tensor,
-        add_baseline_noise: bool = True,
-    ) -> SlicedWaveform:
-        """Sparse streaming variant: group segments by time proximity, build a
-        small dense histogram per group via ``histogram_pdf`` (checkpoint-ed),
-        convolve each with a small FFT, and assemble into a ``SlicedWaveform``.
-
-        Peak memory is independent of both ``N`` (segment count, via
-        per-chunk checkpointing inside ``histogram_pdf``) **and** total event
-        time span (via time-grouping + per-group FFTs instead of one
-        monolithic FFT). For a full LArTPC event (N ≈ 100 k, 3 ms span):
-        ~5 GB vs ~23 GB for the dense V1 streaming path.
-        """
         cfg = self.config
         device = self._device
         fine_tick = self._fine_tick
@@ -208,18 +122,13 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
         sampler = cfg.tof_sampler
         n_ch = cfg.n_channels
 
-        if cfg.ser_jitter_std > 0:
-            import warnings
-            warnings.warn(
-                "ser_jitter_std is ignored in streaming mode (no per-photon weights); "
-                "use streaming=False if you need SER jitter."
-            )
-
-        t_window = sampler.t_max_ns
+        # Most PCA samplers expose `t_max_ns` as a property; a generic mock
+        # sampler may not. Default to 600 ns (the shipped basis's window).
+        t_window = getattr(sampler, "t_max_ns", 600.0)
         kernel_extent_ns = float(fine_kernel_tensor.shape[0]) * fine_tick
         gap_threshold = kernel_extent_ns + t_window + _GAP_THRESHOLD_PAD_NS
 
-        # ---- 1. Sort segments by t_step and split at natural time gaps ----
+        # ---- 1. Group segments by t_step proximity ----
         if t_step.numel() == 0:
             return SlicedWaveform(
                 adc=torch.zeros(0, device=device),
@@ -230,17 +139,13 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
                 attrs={"pe_counts": torch.zeros(n_ch, device=device)},
             )
 
-        order = t_step.detach().argsort()
-        t_sorted = t_step[order].detach()
-        gaps = torch.diff(t_sorted)
-        split_points = (gaps > gap_threshold).nonzero(as_tuple=True)[0] + 1
-        groups = torch.tensor_split(order, split_points.cpu())
+        time_groups = time_group_segments(t_step, gap_threshold)
 
         # Pre-compute every group's t0_g and n_bins_g in two batched ops, then
         # one combined .tolist() — collapses 2 host-syncs per group (.min().item()
         # and .max().item()) into 2 syncs total.
-        group_min = torch.stack([t_step[g].detach().min() for g in groups])
-        group_max = torch.stack([t_step[g].detach().max() for g in groups])
+        group_min = torch.stack([t_step[g].detach().min() for g in time_groups])
+        group_max = torch.stack([t_step[g].detach().max() for g in time_groups])
         t0_starts = (group_min / fine_tick).floor() * fine_tick
         n_bins_t = (
             ((group_max - t0_starts + t_window) / fine_tick).floor().long()
@@ -256,7 +161,7 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
         all_pmt = []
         total_pe = torch.zeros(n_ch, device=device, dtype=torch.float32)
 
-        for gi, g_idx in enumerate(groups):
+        for gi, g_idx in enumerate(time_groups):
             t_g = t_step[g_idx]
             t0_g = float(t0_starts_cpu[gi])
             n_bins_g = int(n_bins_cpu[gi])
@@ -324,5 +229,5 @@ class DifferentiableOpticalSimulator(OpticalSimulator):
             )
             sw.attrs["pedestal"] = cfg.digitization.pedestal
 
-        return sw
+        return sw if stitched else sw.deslice()
 

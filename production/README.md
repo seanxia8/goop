@@ -56,7 +56,8 @@ python3 production/run_batch.py \
 | `--oversample` | 10 | Internal oversampling factor |
 | `--total-pad` | 250,000 | Max deposits per side (jaxtpc JIT shape) |
 | `--response-chunk-size` | 50,000 | jaxtpc response chunk size |
-| `--lazy` | off | Use lazy (disk-backed) photon library loading |
+| `--sampler` | `lut` | TOF sampler backend: `lut` (eager voxel LUT) or `siren` (SIREN neural net) |
+| `--voxel-dx` | 0.0 | Voxelize input segments to a cubic grid of side length `dx` (mm) before goop simulate, performed per-label group. `0` disables. |
 | `--workers` | 2 | Number of save worker threads (0 = serial) |
 | `--seed` | 42 | Random seed |
 | `--align` | off | Align chunks when returning `List[SlicedWaveform]` |
@@ -70,14 +71,15 @@ For each event, `run_batch.py` performs:
 1. **Load** particle step data from HDF5 via `load_event`
 2. **Light generation** via jaxtpc `process_event_light` — yields per-volume photon counts, positions (mm), and deposit times (us)
 3. **Extract** GOOP inputs: `positions_mm`, `ceil(photons).int32`, `t0_us * 1000` (-> ns), per-deposit labels (interaction ID by default; configurable via `--label-key`)
-4. **Optical simulation** via GOOP `OpticalSimulator.simulate` — produces one `SlicedWaveform` per unique label value:
-   - Photon library lookup + TOF sampling (PCA-compressed, inverse-CDF)
+4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. 4. **Voxelize** *(optional, when `--voxel-dx > 0`)* — bin segments per-label-group into a cubic grid of side length `dx` mm via `voxelize_labeled`. Photon counts are summed within each voxel; positions and times are photon-weighted means. Empirically a `dx` of 10 mm results in 20x less point simulated but indistinguishable waveforms.
+5. **Optical simulation** via GOOP `OpticalSimulator.simulate` — produces one `SlicedWaveform` per unique label value:
+   - TOF sampling: either eager voxel LUT (default, `--sampler lut`) or SIREN neural net (`--sampler siren`); both use the same PCA basis (50 components, quantile-log) and inverse-CDF photon-time draw
    - Stochastic delays: scintillation (bi-exponential), TPB re-emission (tri-exponential), PMT TTS (Gaussian)
    - Optional dark noise injection
    - Histogramming into per-PMT time bins
    - FFT convolution with SER kernel (10 us duration)
    - Optional baseline noise + ADC digitization (15-bit, pedestal offset, saturation clamping)
-5. **Save** per-label `SlicedWaveform` to HDF5 via `save_event_light`
+6. **Save** per-label `SlicedWaveform` to HDF5 via `save_event_light`
 
 ### Label Keys
 
@@ -89,6 +91,18 @@ The `--label-key` flag controls how deposits are grouped into separate waveforms
 | `track` | `track_ids` | One waveform per GEANT4 particle track |
 | `ancestor` | `ancestor_track_ids` | One waveform per primary shower ancestor |
 | `volume` | synthetic | One waveform per detector volume (east/west) |
+
+### TOF Sampler Choice
+
+`--sampler lut` (default) loads the full PCA-compressed photon library into GPU memory at startup (~26 GB). Each sample lookup is a fast trilinear interpolation on the resident grid.
+
+`--sampler siren` uses a pre-trained `PcaSiren` network that predicts the same `(visibility, t0, PCA coefficients)` tuple as the LUT, but on demand via a network forward — no resident voxel grid. Memory footprint drops from ~26 GB to ~500 MB; per-call cost is higher because every unique segment position pays a network forward. **Voxelization (`--voxel-dx`) helps SIREN much more than LUT** because it dramatically reduces the number of unique positions hitting the network (see Performance below).
+
+### Voxelization
+
+`--voxel-dx FLOAT` (mm) bins input segments into cubic voxels before the simulate call. For each label group separately, segments at the same voxel index are merged: photon counts summed, positions and times averaged photon-weighted. Total photon yield is exactly preserved.
+
+Reduction is ~15–20× at 20 mm. The simulator output is unchanged in expectation; the only cost is the spatial averaging of segments within a voxel (relevant if intra-voxel timing structure matters, which it generally doesn't at this voxel scale because per-photon delays add ~1 ns of TTS jitter on top).
 
 ## Output File Format
 
@@ -146,7 +160,8 @@ for wf in waveforms:
 
 | Component | Size | Notes |
 |---|---|---|
-| Photon library | 26 GB | PCA-compressed, quantile-log, 50 components. Loaded into GPU VRAM (eager) or disk-backed (lazy) |
+| Photon library (LUT sampler) | ~26 GB | PCA-compressed, quantile-log, 50 components. Loaded eagerly into GPU VRAM. |
+| SIREN sampler | ~500 MB | Pre-trained `PcaSiren` checkpoint; predicts the same `(vis, t0, coeffs)` as the LUT on demand. |
 | SER kernel | ~10K samples | 10 us duration at 1 ns tick, oversampled 10x internally |
 | 162 PMT channels | 81 per volume | x-reflection symmetry maps half-detector library to full coverage |
 
@@ -172,7 +187,7 @@ Main thread:      light+GOOP N ──── light+GOOP N+1 ── light+GOOP N+2
 Save workers:     save N-1 ──────── save N ─────────── save N+1 ────────
 ```
 
-### 1. Prefetch thread (1 thread, not configurable)
+### 1. Prefetch thread
 
 A single background thread pre-reads the next event from HDF5 via `load_event` (CPU-only: HDF5 read + numpy array construction). The result is held in a `Future` that the main thread collects at the start of the next iteration. This hides the ~0.15s HDF5 read latency behind GPU work.
 
@@ -182,7 +197,8 @@ Only CPU work runs in this thread — all GPU work (JAX light generation, PyTorc
 
 Runs all GPU computation sequentially:
 - **jaxtpc** `process_event_light` (JAX) — photon yield calculation (~0.02s)
-- **GOOP** `simulate` (PyTorch) — TOF sampling, delays, histogramming, FFT convolution (~2.3s)
+- **voxelize_labeled** (torch on GPU, optional) — JAX → torch via dlpack (zero-copy), then per-label `torch.unique` + `index_add_` (~20 ms when `--voxel-dx > 0`, dominated by the per-label Python loop; 0 when off)
+- **GOOP** `simulate` (PyTorch) — TOF sampling, delays, histogramming, FFT convolution
 - GPU → CPU tensor transfer before queuing to save workers
 
 ### 3. Save workers (`--workers N`, default 2)
@@ -205,17 +221,29 @@ Background threads that pull completed events from a bounded queue and write the
 
 ## Performance
 
-Benchmarked on NVIDIA A100-SXM4-40GB, `--label-key interaction`, `--workers 2`, eager photon library.
-Timing averaged over events 3–7 (after 3 warmup events):
+Benchmarked on NVIDIA A100-SXM4-40GB, `--label-key interaction`, `--workers 2`, `--oversample 10`, `--n-bits 15` (all defaults), `out.h5` events 0–2 (~95k–264k segments, ~140M–407M photons / event).
 
-| Stage | Serial (`--workers 0`) | Threaded (`--workers 2`) |
-|---|---|---|
-| Load (HDF5 read) | ~0.15s | ~0.00s (prefetched) |
-| Light generation (jaxtpc) | ~0.02s | ~0.02s |
-| GOOP simulation | ~2.3s | ~2.3s |
-| Save (HDF5 write) | ~3.0s | ~0.04s (queued) |
-| **Total/event** | **~5.5s** | **~2.4s** |
+### Sampler × voxelization sweep (avg per-event wall-clock)
 
-- Warmup (JIT + photon library load): ~22s one-time cost
-- GOOP simulator creation: ~12–17s (photon library decompression)
-- Sim time scales with photon count: ~1.8s for small events (~180M photons), ~2.6s for large (~400M photons)
+| Stage | LUT | LUT, 10 mm voxels | SIREN | SIREN, 10 mm voxels |
+|---|---|---|---|---|
+| Load (HDF5 read)            | 0.05 s | 0.05 s | 0.05 s | 0.05 s |
+| Light generation (jaxtpc)   | 0.01 s | 0.01 s | 0.01 s | 0.01 s |
+| Voxelization (per-label)    | —      | 0.02 s | —      | 0.02 s |
+| GOOP simulation             | 0.89 s | 0.74 s | 4.20 s | 1.04 s |
+| Save (queue put)            | 0.01 s | 0.01 s | 0.01 s | 0.01 s |
+| Loop overhead (gc + queue drain) | 0.30 s | 0.14 s | 0.28 s | 0.14 s |
+| **Total / event**           | **1.26 s** | **0.97 s** | **4.56 s** | **1.27 s** |
+
+At `--voxel-dx 10` the per-event voxel count drops from ~95k–264k raw segments to ~6k–21k voxels; with 1 ns ticks, the final waveform is preserved exactly.
+
+The "Loop overhead" row is the wall-clock between per-event timed stages: `gc.collect()` and tensor reference releases at the bottom of the per-event loop, plus the end-of-file `save_queue.join()` that waits for trailing background saves. It scales with how big each event's tensors were (LUT/SIREN at no-vox hold ~370 M-photon intermediates, so the gc / dealloc cost is correspondingly larger).
+
+With `--workers 0` the save stage runs synchronously and adds ~0.24 s / event to every total above (and removes the `save_queue.join()` portion of loop overhead).
+
+## Tips
+
+A voxel size of 10 mm is around the maximum voxel size you can use before seeing unphysical changes in the raw downstream waveforms.
+
+If running into OOM issues when using the non-lazy LUT, switch to using Siren as the sampler (`--sampler siren`); set the voxelization to 10 mm (`--voxel-dx 10`), otherwise there will be a bottleneck due to the number of Siren evaluations scaling with the number of input segments.
+

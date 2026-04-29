@@ -134,6 +134,42 @@ def extract_goop_inputs(filled, cfg, label_key='interaction'):
     return pos_mm, n_photons, t_step_ns, labels, pdgs, dEs, total_segs
 
 
+def voxelize_labeled(pos_mm, n_photons, t_step_ns, labels, dx,
+                     device='cuda'):
+    """Voxelize each label's segments independently and concatenate.
+
+    Per-label voxelization preserves the label semantics that drive the
+    OpticalSimulator's per-waveform split — segments from different labels
+    cannot be merged into the same voxel.
+
+    JAX inputs (from ``extract_goop_inputs``) are zero-copied onto the GPU
+    via dlpack and the entire computation runs on `device`. Returns torch
+    tensors on `device`, ready to feed into ``simulate``.
+    """
+    pos = torch.from_dlpack(pos_mm).to(device=device, dtype=torch.float32)
+    nph = torch.from_dlpack(n_photons).to(device=device, dtype=torch.long)
+    tns = torch.from_dlpack(t_step_ns).to(device=device, dtype=torch.float32)
+    lbl = torch.from_dlpack(labels).to(device=device, dtype=torch.long)
+
+    pv_all, npv_all, tv_all, lbl_all = [], [], [], []
+    for unique_lbl in torch.unique(lbl).tolist():
+        mask = lbl == unique_lbl
+        if not bool(mask.any()):
+            continue
+        p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], dx=dx)
+        pv_all.append(p_v)
+        npv_all.append(n_v)
+        tv_all.append(t_v)
+        lbl_all.append(torch.full(
+            (p_v.shape[0],), unique_lbl, device=device, dtype=torch.long,
+        ))
+
+    return (torch.cat(pv_all),
+            torch.cat(npv_all),
+            torch.cat(tv_all),
+            torch.cat(lbl_all))
+
+
 # =============================================================================
 # MAIN
 # =============================================================================
@@ -190,9 +226,17 @@ def main():
                         help='Padding for segment arrays (default: 250000)')
     parser.add_argument('--response-chunk-size', type=int, default=50_000,
                         help='jaxtpc response chunk size (default: 50000)')
+    # Sampler
+    parser.add_argument('--sampler', choices=['lut', 'siren'], default='lut',
+                        help='TOF sampler backend: lut (voxel LUT, eager) or '
+                             'siren (SIREN neural network); default: lut')
+    # Voxelization
+    parser.add_argument('--voxel-dx', type=float, default=0.0,
+                        help='Voxelize input segments to a cubic grid of side '
+                             'length dx (mm) before goop simulate. Voxelization '
+                             'is performed per-label group so per-waveform label '
+                             'separation is preserved. 0 disables (default).')
     # Other
-    parser.add_argument('--lazy', action='store_true',
-                        help='Use lazy photon library loading')
     parser.add_argument('--workers', type=int, default=2,
                         help='Number of save worker threads (0=serial, default: 2)')
     parser.add_argument('--seed', type=int, default=42)
@@ -251,7 +295,9 @@ def main():
     print(f'  Baseline noise: {args.baseline_noise_std}')
     print(f'  Tick:           {args.tick_ns} ns')
     print(f'  Oversample:     {args.oversample}x')
-    print(f'  Lazy plib:      {"ON" if args.lazy else "OFF"}')
+    print(f'  Sampler:        {args.sampler.upper()}')
+    print(f'  Voxel dx:       {args.voxel_dx} mm'
+          + ('  (disabled)' if args.voxel_dx <= 0 else ''))
     print(f'  Total pad:      {args.total_pad:,}')
     print(f'  Workers:        {args.workers} {"(serial)" if args.workers == 0 else "(threaded)"}')
     print(f'  JAX device:     {jax.devices()[0]}')
@@ -276,8 +322,12 @@ def main():
 
     # ---- Create GOOP simulator ----
     t_goop = time.time()
+    if args.sampler == 'lut':
+        tof_sampler = create_default_tof_sampler()
+    else:  # siren
+        tof_sampler = create_siren_tof_sampler(device='cuda')
     goop_config = OpticalSimConfig(
-        tof_sampler=create_default_tof_sampler(lazy=args.lazy),
+        tof_sampler=tof_sampler,
         delays=[
             ScintillationBiexponentialDelay(
                 singlet_fraction=0.3, tau_singlet_ns=6.0, tau_triplet_ns=1300.0),
@@ -411,10 +461,11 @@ def main():
                 """Load event from HDF5 (CPU-only, no GPU work)."""
                 return load_event(args.data, cfg, event_idx=evt_idx)
 
-            print(f"  {'Evt':>4} {'Segs':>8} {'Photons':>12} "
+            print(f"  {'Evt':>4} {'Segs':>16} {'Photons':>12} "
                   f"{'Labels':>6} {'PEs':>10} {'Chunks':>7} "
-                  f"{'t_load':>6} {'t_light':>7} {'t_goop':>6} {'t_save':>6} {'total':>6}")
-            print(f"  {'-' * 95}")
+                  f"{'t_load':>6} {'t_light':>7} {'t_vox':>6} "
+                  f"{'t_goop':>6} {'t_save':>6} {'total':>6}")
+            print(f"  {'-' * 110}")
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=1) as prefetch:
                 # Submit first load immediately
@@ -479,11 +530,14 @@ def main():
 
                     t_total = t_load + t_light + t_goop_elapsed + t_save
 
-                    print(f"  {evt_idx:>4} {total_segs:>8,} "
+                    segs_str = (f'{total_segs:,}->{n_after:,}'
+                                if args.voxel_dx > 0 else f'{total_segs:,}')
+                    print(f"  {evt_idx:>4} {segs_str:>16} "
                           f"{total_photons:>12,} "
                           f"{n_labels_evt:>6} {total_pe:>10,} "
                           f"{total_chunks:>7,} "
                           f"{t_load:>5.2f}s {t_light:>6.2f}s "
+                          f"{t_vox:>5.2f}s "
                           f"{t_goop_elapsed:>5.2f}s {t_save:>5.2f}s "
                           f"{t_total:>5.1f}s")
 

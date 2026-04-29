@@ -50,19 +50,22 @@ sim = OpticalSimulator(config)
 
 # simulate (inputs are (N,3) positions in mm, (N,) photon counts, (N,) times in ns)
 # accepts torch tensors or JAX arrays (auto-converted via dlpack)
-result = sim.simulate(pos, n_photons, t_step, stitched=True)
+result = sim.simulate(pos, n_photons, t_step)
 result.attrs["pe_counts"]  # (n_channels,) detected PE per PMT
 ```
 
-### Differentiable simulator
+### Differentiable mode
 
-`DifferentiableOpticalSimulator` runs the same pipeline with all gradient-blocking ops replaced or modified: all per-photon delay sampling (e.g., scintillation / TPB reemission delays) becomes a `Response` composite-kernel convolution (Scint * TPB * TTS * SER), per-photon TOF sampling becomes deterministic PDF deposition (which gives the expectation), and ADC quantization is wrapped in a straight-through estimator (`digitize_ste`).
-
-Gradients flow from `pos`, `t_step`, `n_photons` all the way through to `sw.adc` and `sw.attrs["pe_counts"]`.
+The same `OpticalSimulator` runs in expectation mode when called with
+`stochastic=False`: per-photon Poisson sampling becomes deterministic PDF
+deposition, per-photon delay sampling becomes a `Response` composite-kernel
+convolution (Scint ⊛ TPB ⊛ TTS ⊛ SER), and ADC quantization is wrapped in
+a straight-through estimator. Gradients flow from `pos`, `n_photons` all
+the way through to `sw.adc` and `sw.attrs["pe_counts"]`.
 
 ```python
 from goop import (
-    DifferentiableOpticalSimulator, OpticalSimConfig,
+    OpticalSimulator, OpticalSimConfig,
     Response, ScintillationKernel, TPBExponentialKernel, TTSKernel, SERKernel,
     create_default_tof_sampler,
 )
@@ -71,8 +74,8 @@ from goop.delays import Delays
 device = torch.device("cuda")
 
 config = OpticalSimConfig(
-    tof_sampler=create_default_tof_sampler(device=str(device)),   # LUT sampler (see below)
-    delays=Delays([]),  # delays are now in the kernel — see below
+    tof_sampler=create_default_tof_sampler(device=str(device)),
+    delays=Delays([]),  # delays are now in the kernel
     kernel=Response(
         kernels=[
             ScintillationKernel(device=device),
@@ -84,11 +87,11 @@ config = OpticalSimConfig(
     ),
     device=str(device), tick_ns=1.0, gain=-45.0,
 )
-sim = DifferentiableOpticalSimulator(config)
+sim = OpticalSimulator(config)
 
 # pos / n_photons / t_step can carry requires_grad=True
 n_photons = torch.full((n_pos,), 10_000.0, device=device, requires_grad=True)
-sw = sim.simulate(pos, n_photons, t_step, stitched=True)
+sw = sim.simulate(pos, n_photons, t_step, stochastic=False)
 
 loss = sw.adc.pow(2).sum()
 loss.backward()           # n_photons.grad now populated
@@ -96,7 +99,7 @@ loss.backward()           # n_photons.grad now populated
 
 ### TOF samplers: voxel LUT vs SIREN
 
-Every PCA-compressed TOF sampler inherits from `PCATOFSampler` (quantile-time reconstruction, Poisson + inverse-CDF `sample`, differentiable `sample_pdf`). Two concrete backends ship in `goop.sampler`:
+Every PCA-compressed TOF sampler inherits from `PCATOFSampler` (quantile-time reconstruction; Poisson + inverse-CDF in stochastic mode, deterministic PDF deposition in `stochastic=False` mode — the dispatch is on the `stochastic=` kwarg of `sample_photons` / `sample_histogram`). Two concrete backends ship in `goop.sampler`:
 
 - **`TOFSampler`** (voxel LUT) — trilinear interpolation of `(vis, t0, coeffs)` from the compressed photon library. Fast on GPU but memory-heavy (the full LUT is ≈24 GB at the default 1.6 M voxels × 81 PMTs × 50 coefficients).
 - **`SirenTOFSampler`** — the LUT lookup is replaced by a pre-trained SIREN network (`sirentv.models.pca_siren.PcaSiren`) that predicts `(vis, log_t0, coeffs)` in the *same* PCA basis. Keeps the entire lookup differentiable end-to-end (gradients flow through the network back to input positions), with essentially constant memory and wall-clock cost similar to the LUT in practice.
@@ -140,7 +143,7 @@ By default the differentiable simulator builds the full event histogram in one p
 
 ```python
 from goop import (
-    OpticalSimConfig, DifferentiableOpticalSimulator,
+    OpticalSimConfig, DifferentiableOpticalSimulator, Optical 
     Response, SERKernel, create_siren_tof_sampler, voxelize,
 )
 from goop.delays import Delays
@@ -162,9 +165,11 @@ cfg = OpticalSimConfig(
     kernel=Response(kernels=[SERKernel(duration_ns=2000.0, device="cuda")],
                     tick_ns=1.0, device="cuda"),
     device="cuda", tick_ns=1.0, gain=-45.0,
-    stream_chunk_size=5_000, stream_checkpoint=False,
+    pos_batch_size=5_000, checkpoint=False,
 )
-sim = DifferentiableOpticalSimulator(cfg)
+sim = OpticalSimulator(cfg)
+# call with stochastic=False to engage the differentiable path:
+# sw = sim.simulate(pos_v, nph_v, tns_v, stochastic=False)
 ```
 
 This is the recommended setup for Adam fits on full events.
@@ -175,7 +180,7 @@ Split output by any per-position grouping (detector volume, interaction ID, etc.
 
 ```python
 labels = torch.tensor([0, 0, 0, 1, 1])  # one label per position
-waveforms = sim.simulate(pos, n_photons, t_step, labels=labels, stitched=True)
+waveforms = sim.simulate(pos, n_photons, t_step, labels=labels)
 # returns list[SlicedWaveform], one per unique label value
 ```
 
@@ -207,7 +212,7 @@ result = OpticalSimulator(config).simulate(pos, n_photons, t_step)
 
 ### Output types
 
-**`SlicedWaveform`** (`stitched=True`, default) — compressed CSR format, only stores active regions:
+**`SlicedWaveform`** (`sliced=True`, default) — compressed CSR format, only stores active regions:
 ```python
 result.adc       # (total_bins,)  all chunks concatenated
 result.offsets   # (n_chunks+1,)  CSR boundaries: chunk k = adc[offsets[k]:offsets[k+1]]
@@ -221,7 +226,7 @@ result.deslice()           # decompress to full Waveform
 result.deslice_channel(ch) # decompress one PMT -> (t0, 1D tensor)
 ```
 
-**`Waveform`** (`stitched=False`) — full shared time axis:
+**`Waveform`** (`sliced=False`) — full shared time axis:
 ```python
 result.adc       # (n_channels, n_bins) tensor
 result.t0        # time origin (ns)
@@ -252,7 +257,7 @@ with h5py.File("light_output.h5", "w") as f:
 
     for i in range(100):
         waveforms = sim.simulate(pos, n_photons, t_step,
-                                 labels=volume_labels, stitched=True,
+                                 labels=volume_labels,
                                  add_baseline_noise=False)  # noise-free for compression
         save_event_light(f, f"event_{i:03d}", waveforms,
                          source_event_idx=i,
@@ -333,11 +338,13 @@ Each pipeline component is defined by an abstract base class (`base.py`), making
 | `stream_chunk_size` | 5000 | Segments per gradient-checkpointed micro-batch inside `histogram_pdf` |
 | `stream_checkpoint` | True | Per-chunk `torch.utils.checkpoint` in the streaming path; turn off at small N (e.g. after voxelization) |
 
+
 **`simulate()` options**:
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `labels` | None | Per-position integer labels; splits output into `list[SlicedWaveform]` via virtual-channel batching |
-| `stitched` | True | Return `SlicedWaveform` (True) or dense `Waveform` (False) |
+| `sliced` | True | Return `SlicedWaveform` (True) or dense `Waveform` (False) |
+| `stochastic` | True | Poisson + per-photon delay sampling (True) or deterministic PDF deposition + differentiable (False) |
 | `subtract_t0` | False | Shift `t_step` so the minimum is zero |
 | `add_baseline_noise` | True | Add Gaussian baseline noise; set False when saving to disk for better compression |
 
@@ -351,8 +358,7 @@ See [`notebooks/minimal_example.ipynb`](notebooks/minimal_example.ipynb) for a c
 
 ```
 goop/
-    simulator.py       OpticalSimConfig, OpticalSimulator
-    diff_simulator.py  DifferentiableOpticalSimulator
+    simulator.py       OpticalSimConfig, OpticalSimulator (stochastic + expectation)
     waveform.py        Waveform, SlicedWaveform
     waveform_utils.py  helper functions (slicing, FFT utilities)
     kernels.py         RLCKernel, SERKernel, ScintillationKernel, TPBExponentialKernel,
@@ -372,9 +378,42 @@ goop/
 ## Tests
 
 ```bash
-python -m pytest tests/ -v
+# default dev loop (skips benchmarks)
+pytest tests/ -q
+
+# real-event tests skip automatically without GPU + SIREN assets;
+# regenerate the fixture from a fresh edepsim file with
+python tests/data/regen_edepsim_event0.py
 ```
+
+### Performance benchmarks
+
+Speed regressions on the realistic-event matrix are tracked with `pytest-benchmark`. Six benchmarks (`stoch/diff × sliced/dense fwd` + `diff fwd+bwd` × `sliced/dense`) live in `tests/test_real_edepsim_bench.py`. They are skipped by default (`pytest.ini: addopts = --benchmark-skip`).
+
+```bash
+# Run benchmarks (~18 s on GPU):
+pytest tests/test_real_edepsim_bench.py --benchmark-only
+
+# Save a baseline on a known-good commit:
+pytest tests/test_real_edepsim_bench.py --benchmark-only --benchmark-save=main
+
+# Compare a feature branch against the baseline; fail on >25% median regression:
+pytest tests/test_real_edepsim_bench.py --benchmark-only \
+       --benchmark-compare=main --benchmark-compare-fail=median:25%
+```
+
+Baselines are saved under `.benchmarks/` (gitignored — machine-specific).
+
+Reference numbers from a single A100-class GPU on event 0 (12 k voxelized segments, 371 M photons, 3.3 ms span) — useful as a sanity check that your local install is in the right ballpark, not a contract:
+
+| Benchmark | Median |
+|---|---:|
+| `diff sliced fwd` | 157 ms |
+| `diff dense fwd` | 171 ms |
+| `diff sliced fwd+bwd` | 194 ms |
+| `diff dense fwd+bwd` | 221 ms |
+| `stoch sliced fwd` | 671 ms |
+| `stoch dense fwd` | 654 ms |
 
 ## TODO
 
-1. benchmarking for speed/mem. usage
