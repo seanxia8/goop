@@ -1,10 +1,10 @@
 """
 Shared base for PCA-compressed photon-library TOF samplers.
 
-``PCATOFSampler`` holds the quantile-time reconstruction + sampling machinery
+`PCATOFSampler` holds the quantile-time reconstruction + sampling machinery
 (Poisson + inverse-CDF, differentiable PDF deposition) that is independent of
-*how* ``(vis, t0, coeffs)`` are produced. Subclasses implement only
-``_lookup(pos)``.
+*how* `(vis, t0, coeffs)` are produced. Subclasses implement only
+`_lookup(pos)`.
 """
 
 from abc import abstractmethod
@@ -28,23 +28,23 @@ DEFAULT_N_SIMULATED = 15_000_000
 class PCATOFSampler(TOFSamplerBase):
     """Abstract base for PCA-compressed TOF samplers.
 
-    Subclasses implement only ``_lookup(pos) -> (vis, t0, coeffs)`` — how the
+    Subclasses implement only `_lookup(pos) -> (vis, t0, coeffs)` — how the
     per-PMT visibility, t0, and PCA coefficients are obtained (voxel LUT,
     neural network, ...). Everything else — quantile reconstruction, Poisson +
-    inverse-CDF sampling (``sample``), and the differentiable PDF deposition
-    path (``sample_pdf``) — is shared here.
+    inverse-CDF sampling (`sample`), and the differentiable PDF deposition
+    path (`sample_pdf`) — is shared here.
 
-    All subclasses must populate the following fields in their ``__init__``
-    (directly or via ``_init_common`` / ``_read_h5_basis``):
+    All subclasses must populate the following fields in their `__init__`
+    (directly or via `_init_common` / `_read_h5_basis`):
 
-        ``_device``, ``_n_pmts``, ``_n_components``, ``_pmt_qe``,
-        ``n_simulated``, ``_log_quantile_C``, ``_t_max_ns``, ``_mode``,
-        ``pca_mean`` (Q,), ``pca_components`` (K, Q), ``u_grid`` (Q,),
-        ``_du`` (Q,), ``_numvox`` (3,), ``_min_xyz`` (3,), ``_max_xyz`` (3,).
+        `_device`, `_n_pmts`, `_n_components`, `_pmt_qe`,
+        `n_simulated`, `_log_quantile_C`, `_t_max_ns`, `_mode`,
+        `pca_mean` (Q,), `pca_components` (K, Q), `u_grid` (Q,),
+        `_du` (Q,), `_numvox` (3,), `_min_xyz` (3,), `_max_xyz` (3,).
 
     Full-detector output: the compressed plib is half-detector (x ≤ 0, P
-    PMTs); x > 0 positions are x-mirrored before ``_lookup`` and assigned
-    PMT ids P..(2P-1). ``n_channels == 2 * _n_pmts``.
+    PMTs); x > 0 positions are x-mirrored before `_lookup` and assigned
+    PMT ids P..(2P-1). `n_channels == 2 * _n_pmts`.
     """
 
     def _init_common(
@@ -77,15 +77,14 @@ class PCATOFSampler(TOFSamplerBase):
         self.pca_mean = pca_mean.to(dtype=torch.float32, device=self._device)
         self.pca_components = pca_components.to(dtype=torch.float32, device=self._device)
         self.u_grid = u_grid.to(dtype=torch.float32, device=self._device)
-        self._du = torch.diff(self.u_grid, prepend=torch.zeros(1, device=self._device))
+        self._du = torch.diff(self.u_grid, prepend=torch.zeros(1, device=self._device)) # (Q,) probability mass per bin
         self._cumdu = torch.cat([
             torch.zeros(1, device=self._device),
             self._du.cumsum(0),
         ])  # (Q+1,) — CDF values at each u-grid point, with 0 prepended.
         # q_stride=1 keeps all Q u-grid points in sample_pdf. Users can set
-        # ``sampler.q_stride = K`` (or pass ``q_stride=K`` to sample_pdf) to
-        # subsample every K-th quantile point — cuts the (M, Q) tensors
-        # proportionally. ``du`` is recomputed from the subsampled grid so
+        # `sampler.q_stride = K` (or pass `q_stride=K` to sample_pdf) to
+        # subsample every K-th quantile point `du` is recomputed from the subsampled grid so
         # total probability mass is preserved.
         self.q_stride = 1
         self._numvox = numvox.to(dtype=torch.long, device=self._device)
@@ -96,8 +95,8 @@ class PCATOFSampler(TOFSamplerBase):
     def _read_h5_basis(filepath):
         """Read shared PCA-basis + voxel-grid + PMT positions from a compressed plib.
 
-        Returns a dict of ready-to-pass fields plus ``pmt_pos`` (np.ndarray) and
-        ``n_voxels`` (int). Does not load the per-voxel LUT tensors (vis/t0/coeffs).
+        Returns a dict of ready-to-pass fields plus `pmt_pos` (np.ndarray) and
+        `n_voxels` (int). Does not load the per-voxel LUT tensors (vis/t0/coeffs).
         """
         with h5py.File(filepath, "r") as f:
             return dict(
@@ -120,10 +119,10 @@ class PCATOFSampler(TOFSamplerBase):
 
     @abstractmethod
     def _lookup(self, pos: torch.Tensor):
-        """Return (vis, t0, coeffs) for each position in ``pos`` (N, 3).
+        """Return (vis, t0, coeffs) for each position in `pos` (N, 3).
 
         Shapes: vis (N, P), t0 (N, P), coeffs (N, P, K). Must be differentiable
-        with respect to ``pos`` if gradients are desired. Input positions are
+        with respect to `pos` if gradients are desired. Input positions are
         assumed to be on the plib's half-detector side (x <= 0); callers handle
         x-mirroring before invoking this method.
         """
@@ -137,13 +136,13 @@ class PCATOFSampler(TOFSamplerBase):
         """Width of the per-segment quantile-time window the basis covers."""
         return self._t_max_ns
 
-    # shared helpers used by sample_pdf and _histogram_chunk
+    # shared helpers used by sample_pdf and _scatter_chunk
 
     def _resolve_q_stride(self, q_stride):
-        """Return ``(q_idx, du_eff)`` for the requested quantile-grid stride.
+        """Return `(q_idx, du_eff)` for the requested quantile-grid stride.
 
         Precedence: explicit kwarg > sampler attribute > 1 (no subsample).
-        Stride>1 preserves total probability mass by recomputing ``du`` from
+        Stride>1 preserves total probability mass by recomputing `du` from
         the subsampled grid.
         """
         stride = int(q_stride if q_stride is not None else getattr(self, "q_stride", 1))
@@ -158,9 +157,9 @@ class PCATOFSampler(TOFSamplerBase):
     def _mirror_x(self, pos_chunk):
         """Mirror x>0 sources into the half-detector basis (cathode symmetry).
 
-        Returns ``(pos_lookup, on_pos_side)``: ``pos_lookup`` is a clone of
-        ``pos_chunk`` with x signs flipped on x>0 rows so a single LUT/SIREN
-        call handles both halves; ``on_pos_side`` records which rows were
+        Returns `(pos_lookup, on_pos_side)`: `pos_lookup` is a clone of
+        `pos_chunk` with x signs flipped on x>0 rows so a single LUT/SIREN
+        call handles both halves; `on_pos_side` records which rows were
         flipped, for routing the output back to the correct PMT id.
         """
         on_pos_side = pos_chunk[:, 0] > 0
@@ -169,10 +168,10 @@ class PCATOFSampler(TOFSamplerBase):
         return pos_lookup, on_pos_side
 
     def _active_pmt_ids(self, on_pos_side, active_mask):
-        """Assemble full-detector PMT ids for ``active_mask`` rows.
+        """Assemble full-detector PMT ids for `active_mask` rows.
 
         Channels 0..P-1 cover x<=0 sources; channels P..2P-1 cover x>0 sources
-        via the cathode-symmetry trick. ``on_pos_side`` (from ``_mirror_x``)
+        via the cathode-symmetry trick. `on_pos_side` (from `_mirror_x`)
         selects the offset.
         """
         P = self._n_pmts
@@ -188,10 +187,10 @@ class PCATOFSampler(TOFSamplerBase):
         coeffs: (M, K), t0: (M,) -> q_abs: (M, Q)
         where M = active pairs, K = PCA components, Q = quantile grid points.
 
-        If ``q_idx`` is given, the PCA basis is subsampled to only the columns
-        named by ``q_idx``, so the output is ``(M, len(q_idx))`` and the
-        ``(M, Q)`` full matrix is never materialised. This is the memory-saving
-        path used by ``sample_pdf`` when ``q_stride > 1``.
+        If `q_idx` is given, the PCA basis is subsampled to only the columns
+        named by `q_idx`, so the output is `(M, len(q_idx))` and the
+        `(M, Q)` full matrix is never materialised. This is the memory-saving
+        path used by `sample_pdf` when `q_stride > 1`.
         """
         if q_idx is None:
             comp = self.pca_components  # (K, Q)
@@ -272,16 +271,17 @@ class PCATOFSampler(TOFSamplerBase):
             v, t0, coeffs = self._lookup(pos_lookup)  # (C,P), (C,P), (C,P,K)
 
             expected = (v * chunk_scale.unsqueeze(1) * self._pmt_qe).clamp_(min=0)  # (C, P)
-            counts = torch.poisson(expected)       # (C, P) Poisson-sampled integer counts
-            active_mask = counts > 0.5             # (C, P) bool — pairs with ≥1 photon
+            # Skip pairs whose total expected yield is well below 1 photon —
+            # Poisson sampling them gives ~0 counts and just wastes work.
+            active_mask = expected > 1e-9          # (C, P) bool
 
-            n_active = active_mask.sum().item()    # M = number of active pairs
+            n_active = active_mask.sum().item()    # M = active pairs
             if n_active == 0:
                 continue
 
-            active_counts = counts[active_mask]    # (M,)
-            active_coeffs = coeffs[active_mask]    # (M, K)
-            active_t0 = t0[active_mask]            # (M,)
+            active_expected = expected[active_mask]   # (M,) per-pair Poisson rate
+            active_coeffs = coeffs[active_mask]       # (M, K)
+            active_t0 = t0[active_mask]               # (M,)
 
             # assign full-detector PMT channel ids (0..2P-1)
             pmt_offset = torch.where(on_pos_side, P, 0).unsqueeze(1).expand(C, P)  # (C, P)
@@ -295,13 +295,25 @@ class PCATOFSampler(TOFSamplerBase):
                 active_t_emit = t_expanded[active_mask]              # (M,)
                 q_abs = q_abs + active_t_emit.unsqueeze(-1)          # (M, Q) shift by emission time
 
+            # Per-cell Poisson sampling: each (pair, q-bin) is an independent
+            # Poisson with rate expected[m] * du[q]. Sum over q gives Poisson(
+            # expected[m]) per pair (sum-of-independent-Poissons property), so
+            # the per-pair total has the same distribution as a single
+            # Poisson(expected) draw — but the spatial structure across bins
+            # is now physical (each photon is an independent event), and
+            # counts are integer at every cell so no truncation step is needed.
+            rate_mq = active_expected.unsqueeze(-1) * du.unsqueeze(0)   # (M, Q)
+            counts_mq = torch.poisson(rate_mq).long()                   # (M, Q) integer counts
+
             # convert quantile times to histogram bins and scatter-add
             bin_idx = (q_abs * inv_tick).long()                      # (M, Q) time bin indices
-            in_window = (bin_idx >= 0) & (bin_idx < n_bins)          # (M, Q) bool — in time range
+            in_window = (bin_idx >= 0) & (bin_idx < n_bins)          # (M, Q) bool
             bin_idx.clamp_(0, n_bins - 1)                            # (M, Q) clamped
-            flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx   # (M, Q) flat index into output
-            weights = active_counts.unsqueeze(-1) * du.unsqueeze(0) * in_window  # (M, Q) weighted counts
-            out_flat.scatter_add_(0, flat_idx.reshape(-1), weights.reshape(-1))  # accumulate
+            flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx   # (M, Q) flat dst index
+            counts_mq = counts_mq * in_window                        # zero out-of-window counts
+            out_flat.scatter_add_(
+                0, flat_idx.reshape(-1), counts_mq.reshape(-1).to(out_flat.dtype),
+            )
 
         return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)
 
@@ -381,6 +393,58 @@ class PCATOFSampler(TOFSamplerBase):
         empty = torch.zeros(0, device=self._device)
         return empty, empty.long(), empty.long()
 
+    def _emit_chunk(
+        self,
+        pos_chunk: torch.Tensor,
+        scale_chunk: torch.Tensor,
+        tns_chunk: torch.Tensor | None,
+        du_eff: torch.Tensor,
+        q_idx,
+        expected_eps: float,
+    ):
+        """One chunk's PCA reconstruction + ghost-photon assembly.
+
+        Returns `(q_abs, active_pmt, weights)` where:
+          q_abs       : (M, Q) absolute quantile times (with t_step shift if
+                        `tns_chunk` is provided).
+          active_pmt  : (M,)   full-detector PMT ids.
+          weights     : (M, Q) probability mass per (pair, quantile bin) —
+                        `expected[pair] * du[bin]`.
+
+        Returns `None` when no (position, PMT) pair exceeds `expected_eps`;
+        callers should short-circuit. No flattening, no scatter — callers
+        decide what to do with the (M, Q) tensors.
+        """
+        P = self._n_pmts
+        C = pos_chunk.shape[0]
+
+        pos_lookup, on_pos_side = self._mirror_x(pos_chunk)
+        v, t0, coeffs = self._lookup(pos_lookup)                # (C,P), (C,P), (C,P,K)
+        expected = v * scale_chunk.unsqueeze(1) * self._pmt_qe   # (C, P) — differentiable
+
+        # Threshold to skip negligible pairs (gradient is zero below; safe for
+        # noise-floor entries, threshold is safely small).
+        active_mask = expected.detach() > expected_eps
+        if not bool(active_mask.any()):
+            return None
+
+        active_expected = expected[active_mask]                  # (M,)
+        active_coeffs   = coeffs[active_mask]                    # (M, K)
+        active_t0       = t0[active_mask]                        # (M,)
+        active_pmt      = self._active_pmt_ids(on_pos_side, active_mask)  # (M,)
+
+        # Build q_abs directly at the subsampled quantile indices (if any) —
+        # avoids ever materialising the full (M, Q_full) matrix.
+        q_abs = self._quantile_times(active_coeffs, active_t0, q_idx=q_idx)  # (M, Q)
+
+        if tns_chunk is not None:
+            t_expanded = tns_chunk.unsqueeze(1).expand(C, P)
+            active_t_emit = t_expanded[active_mask]              # (M,)
+            q_abs = q_abs + active_t_emit.unsqueeze(-1)          # (M, Q)
+
+        weights = active_expected.unsqueeze(-1) * du_eff.unsqueeze(0)  # (M, Q)
+        return q_abs, active_pmt, weights
+
     def sample_pdf(
         self,
         pos,
@@ -392,10 +456,10 @@ class PCATOFSampler(TOFSamplerBase):
     ):
         """Deposit per-PMT expected PDF as weighted synthetic photons.
 
-        Replaces ``torch.poisson(expected)`` with ``expected`` directly (no
-        Poisson sampling — gradients flow to ``n_photons`` and to ``v``,
-        which itself depends on ``pos`` via ``_lookup``), and returns
-        synthetic ``(times, channels, weights)`` triples so that histogramming
+        Replaces `torch.poisson(expected)` with `expected` directly (no
+        Poisson sampling — gradients flow to `n_photons` and to `v`,
+        which itself depends on `pos` via `_lookup`), and returns
+        synthetic `(times, channels, weights)` triples so that histogramming
         with those weights reproduces the per-PMT expected PDF.
 
         Returns
@@ -403,17 +467,16 @@ class PCATOFSampler(TOFSamplerBase):
         times : (M*Q,) float32 — quantile times in ns (absolute, with t_step shift)
         channels : (M*Q,) int64 — full-detector PMT id (0..2P-1)
         weights : (M*Q,) float32 — probability mass per (pair, quantile bin),
-            equal to ``expected[pair] * du[bin]`` so ``Σ weights[pair_q] = expected[pair]``.
+            equal to `expected[pair] * du[bin]` so `Σ weights[pair_q] = expected[pair]`.
 
-        ``M`` is the number of (position, PMT) pairs with ``expected > expected_eps``;
-        ``Q`` is the number of quantile grid points in the PCA basis.
+        `M` is the number of (position, PMT) pairs with `expected > expected_eps`;
+        `Q` is the number of quantile grid points in the PCA basis.
         """
         pos = pos if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
         pos = pos.to(dtype=torch.float32, device=self._device)
         if pos.dim() == 1:
             pos = pos.unsqueeze(0)
         N = pos.shape[0]
-        P = self._n_pmts
 
         if isinstance(n_photons, (int, float)):
             scale = torch.full(
@@ -433,43 +496,19 @@ class PCATOFSampler(TOFSamplerBase):
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
-            chunk_pos = pos[start:end]
-            chunk_scale = scale[start:end]
-            C = end - start
-            chunk_t = t_step[start:end] if t_step is not None else None
-
-            pos_lookup, on_pos_side = self._mirror_x(chunk_pos)
-            v, t0, coeffs = self._lookup(pos_lookup)        # (C,P), (C,P), (C,P,K)
-            expected = v * chunk_scale.unsqueeze(1) * self._pmt_qe  # (C, P) — differentiable
-
-            # Threshold to skip negligible pairs (gradient is zero below; fine
-            # for noise-floor entries, threshold is safely small).
-            active_mask = expected.detach() > expected_eps
-            if not bool(active_mask.any()):
+            emit = self._emit_chunk(
+                pos_chunk=pos[start:end],
+                scale_chunk=scale[start:end],
+                tns_chunk=t_step[start:end] if t_step is not None else None,
+                du_eff=du_eff, q_idx=q_idx, expected_eps=expected_eps,
+            )
+            if emit is None:
                 continue
-
-            active_expected = expected[active_mask]      # (M,)
-            active_coeffs = coeffs[active_mask]          # (M, K)
-            active_t0 = t0[active_mask]                  # (M,)
-            active_pmt = self._active_pmt_ids(on_pos_side, active_mask)  # (M,)
-
-            # Build q_abs directly at the subsampled quantile indices (if any)
-            # — avoids ever materialising the full (M, Q_full) matrix.
-            q_abs = self._quantile_times(active_coeffs, active_t0, q_idx=q_idx)
-
-            if chunk_t is not None:
-                t_expanded = chunk_t.unsqueeze(1).expand(C, P)
-                active_t_emit = t_expanded[active_mask]
-                q_abs = q_abs + active_t_emit.unsqueeze(-1)
-
+            q_abs, active_pmt, weights = emit # (M, Q), (M,), (M, Q)
             Q = q_abs.shape[1]
-            times = q_abs.reshape(-1)                                                # (M*Q,)
-            channels = active_pmt.unsqueeze(-1).expand(-1, Q).reshape(-1)            # (M*Q,)
-            weights = (active_expected.unsqueeze(-1) * du_eff.unsqueeze(0)).reshape(-1)  # (M*Q,)
-
-            all_times.append(times)
-            all_ch.append(channels)
-            all_w.append(weights)
+            all_times.append(q_abs.reshape(-1))
+            all_ch.append(active_pmt.unsqueeze(-1).expand(-1, Q).reshape(-1))
+            all_w.append(weights.reshape(-1))
 
         if all_times:
             return torch.cat(all_times), torch.cat(all_ch), torch.cat(all_w)
@@ -478,7 +517,7 @@ class PCATOFSampler(TOFSamplerBase):
 
     # streaming (chunked) histogram
 
-    def _histogram_chunk(
+    def _scatter_chunk(
         self,
         pos_chunk: torch.Tensor,
         scale_chunk: torch.Tensor,
@@ -492,51 +531,35 @@ class PCATOFSampler(TOFSamplerBase):
     ) -> torch.Tensor:
         """Scatter one chunk's weighted ghost photons into a fresh (2P, n_bins)
         dense histogram. Returns the chunk-local hist; same PE content as
-        ``sample_pdf`` would emit for this chunk, but without materialising the
-        flat ``(M·Q,)`` photon lists (they stay inside this function's scope).
+        `sample_pdf` would emit for this chunk, but without materialising the
+        flat `(M·Q,)` photon lists (they stay inside this function's scope).
 
-        Designed to be wrapped in ``torch.utils.checkpoint.checkpoint(...,
-        use_reentrant=False)`` so the transient ``(M, Q)`` tensors are not
+        Designed to be wrapped in `torch.utils.checkpoint.checkpoint(...,
+        use_reentrant=False)` so the transient `(M, Q)` tensors are not
         saved for backward — they're recomputed on demand.
         """
-        P = self._n_pmts
-        n_ch = 2 * P
-        C = pos_chunk.shape[0]
-
-        pos_lookup, on_pos_side = self._mirror_x(pos_chunk)
-        v, t0, coeffs = self._lookup(pos_lookup)                    # (C,P), (C,P), (C,P,K)
-        expected = v * scale_chunk.unsqueeze(1) * self._pmt_qe       # (C, P)
-        active_mask = expected.detach() > expected_eps
-
+        n_ch = 2 * self._n_pmts
         chunk_hist = torch.zeros(n_ch, n_bins, device=self._device, dtype=torch.float32)
-        if not bool(active_mask.any()):
+
+        emit = self._emit_chunk(
+            pos_chunk=pos_chunk, scale_chunk=scale_chunk, tns_chunk=tns_chunk,
+            du_eff=du_eff, q_idx=q_idx, expected_eps=expected_eps,
+        )
+        if emit is None:
             return chunk_hist
+        q_abs, active_pmt, weights = emit                        # (M, Q), (M,), (M, Q)
 
-        active_expected = expected[active_mask]                      # (M,)
-        active_coeffs   = coeffs[active_mask]                        # (M, K)
-        active_t0       = t0[active_mask]                            # (M,)
-        active_pmt      = self._active_pmt_ids(on_pos_side, active_mask)  # (M,)
-
-        # (M, Q) — subsampled directly via q_idx so the full (M, Q_full) is never built.
-        q_abs = self._quantile_times(active_coeffs, active_t0, q_idx=q_idx)
-
-        t_expanded = tns_chunk.unsqueeze(1).expand(C, P)
-        active_t_emit = t_expanded[active_mask]                      # (M,)
-        q_abs = q_abs + active_t_emit.unsqueeze(-1)                  # (M, Q)
-
-        weights = active_expected.unsqueeze(-1) * du_eff.unsqueeze(0)  # (M, Q)
-
-        bin_idx = ((q_abs - t0_ref) / tick_ns).long()                # (M, Q)
+        bin_idx = ((q_abs - t0_ref) / tick_ns).long()            # (M, Q)
         in_window = (bin_idx >= 0) & (bin_idx < n_bins)
         bin_idx = bin_idx.clamp(0, n_bins - 1)
-        weights = weights * in_window                                 # zero out-of-window
+        weights = weights * in_window                            # zero out-of-window
 
         # Fused scatter: flatten to (2P·n_bins,) with composite (channel, bin) index.
-        flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx        # (M, Q)
+        flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx   # (M, Q)
         flat_hist = chunk_hist.view(-1).scatter_add(
             0, flat_idx.reshape(-1), weights.reshape(-1)
         )
-        return flat_hist.view(n_ch, n_bins)
+        return flat_hist.view(n_ch, n_bins) # (2P, n_bins)
 
     def histogram_pdf(
         self,
@@ -553,38 +576,38 @@ class PCATOFSampler(TOFSamplerBase):
     ) -> torch.Tensor:
         """Differentiable per-PMT PDF deposition as a dense histogram.
 
-        Same mathematical output as ``sample_pdf(...)`` + ``from_photons(...)`` followed
-        by ``SlicedWaveform.deslice()`` aligned to ``t0_ref`` / ``n_bins``, but
-        memory-per-call is ``O(output + one_chunk_work)`` instead of ``O(N·P·Q)``
-        — because each chunk's ``(M, Q)`` ghost-photon tensors are shed from the
-        autograd graph via ``torch.utils.checkpoint`` and recomputed during
+        Same mathematical output as `sample_pdf(...)` + `from_photons(...)` followed
+        by `SlicedWaveform.deslice()` aligned to `t0_ref` / `n_bins`, but
+        memory-per-call is `O(output + one_chunk_work)` instead of `O(N·P·Q)`
+        — because each chunk's `(M, Q)` ghost-photon tensors are shed from the
+        autograd graph via `torch.utils.checkpoint` and recomputed during
         backward.
 
         Parameters
         ----------
         pos, n_photons, t_step : position / yield / emission-time arrays
-            (same shapes and semantics as ``sample_pdf``).
+            (same shapes and semantics as `sample_pdf`).
         tick_ns : float
             Time-bin width.
         n_bins : int
             Number of time bins in the output histogram. Bins with indices
-            outside ``[0, n_bins)`` are silently dropped.
+            outside `[0, n_bins)` are silently dropped.
         t0_ref : float
             Absolute time (ns) corresponding to bin 0. Bin centres lie at
-            ``t0_ref + (b + 0.5) * tick_ns``.
+            `t0_ref + (b + 0.5) * tick_ns`.
         expected_eps : float, optional
             Per-PMT yield threshold; pairs below are skipped (zero-gradient
-            region — safe for noise-floor entries). Default ``1e-9``.
+            region — safe for noise-floor entries). Default `1e-9`.
         chunk_size : int, optional
-            Position chunking for gradient checkpointing. Default ``5000``.
+            Position chunking for gradient checkpointing. Default `5000`.
             Lower = smaller peak memory, higher = less recompute overhead.
         q_stride : int, optional
-            Quantile-grid stride. Explicit kwarg > ``self.q_stride`` > ``1``.
+            Quantile-grid stride. Explicit kwarg > `self.q_stride` > `1`.
 
         Returns
         -------
-        hist : (2*P, n_bins) float32 tensor, differentiable w.r.t. ``pos`` and
-            ``n_photons``.
+        hist : (2*P, n_bins) float32 tensor, differentiable w.r.t. `pos` and
+            `n_photons`.
         """
         pos = pos if isinstance(pos, torch.Tensor) else torch.as_tensor(pos)
         pos = pos.to(dtype=torch.float32, device=self._device)
@@ -622,10 +645,10 @@ class PCATOFSampler(TOFSamplerBase):
             if use_checkpoint:
                 from torch.utils.checkpoint import checkpoint
                 chunk_hist = checkpoint(
-                    self._histogram_chunk, *args, use_reentrant=False,
+                    self._scatter_chunk, *args, use_reentrant=False,
                 )
             else:
-                chunk_hist = self._histogram_chunk(*args)
+                chunk_hist = self._scatter_chunk(*args)
             hist = hist + chunk_hist
 
         return hist

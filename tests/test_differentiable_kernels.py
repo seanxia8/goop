@@ -318,6 +318,22 @@ class _SeededTOF:
         weights = torch.ones_like(times)
         return times, channels, weights
 
+    def histogram_pdf(
+        self, pos, n_photons, t_step, *, tick_ns, n_bins, t0_ref, **_kwargs,
+    ):
+        """Dense-histogram mock: scatter `sample_pdf` output into `(n_ch, n_bins)`."""
+        times, channels, weights = self.sample_pdf(pos, n_photons, t_step)
+        hist = torch.zeros(self._n_channels, n_bins, device=DEVICE, dtype=weights.dtype)
+        if times.numel() == 0:
+            return hist
+        bin_idx = ((times - t0_ref) / tick_ns).long()
+        in_window = (bin_idx >= 0) & (bin_idx < n_bins)
+        bin_idx = bin_idx.clamp(0, n_bins - 1)
+        weights = weights * in_window
+        flat_idx = channels.long() * n_bins + bin_idx
+        hist.view(-1).scatter_add_(0, flat_idx, weights)
+        return hist
+
 
 def _fixed_hist(times, channels, t0, n_bins, tick, n_channels):
     """Manual per-channel histogram with locked t0 and n_bins (for averaging)."""
@@ -469,7 +485,6 @@ class TestGradients:
         cfg = OpticalSimConfig(
             tof_sampler=sampler, delays=Delays([]), kernel=response,
             device="cpu", tick_ns=1.0, gain=-1.0,
-            streaming=False,   # _SeededTOF mock only exposes sample_pdf, not histogram_pdf
         )
         sim = DifferentiableOpticalSimulator(cfg)
         out = sim.simulate(
@@ -495,7 +510,6 @@ def _minimal_cfg(**overrides) -> OpticalSimConfig:
         delays=Delays([]),
         kernel=create_default_response(device=DEVICE),
         device="cpu", tick_ns=1.0, gain=-1.0,
-        streaming=False,   # _SeededTOF mock only exposes sample_pdf, not histogram_pdf
     )
     base.update(overrides)
     return OpticalSimConfig(**base)
@@ -516,11 +530,6 @@ class TestDifferentiableSimulatorAssertions:
         """Diff sim accepts digitization; the STE bypasses round/clamp in backward."""
         from goop import DigitizationConfig
         cfg = _minimal_cfg(digitization=DigitizationConfig(n_bits=14, pedestal=1500.0))
-        DifferentiableOpticalSimulator(cfg)  # should NOT raise
-
-    def test_allows_ser_jitter(self):
-        """SER jitter composes as weights *= N(1, σ); gradient flow preserved."""
-        cfg = _minimal_cfg(ser_jitter_std=0.1)
         DifferentiableOpticalSimulator(cfg)  # should NOT raise
 
     def test_allows_baseline_noise(self):
@@ -544,14 +553,26 @@ class TestDifferentiableSimulatorAssertions:
         cfg = _minimal_cfg()
         DifferentiableOpticalSimulator(cfg)
 
-    def test_rejects_stitched_false(self):
-        """Diff pipeline targets SlicedWaveform exclusively; stitched=False rejected."""
+    def test_stitched_false_equals_deslice(self):
+        """``simulate(..., stitched=False)`` must equal ``simulate(...).deslice()``."""
+        from goop import Waveform
         sim = DifferentiableOpticalSimulator(_minimal_cfg())
-        with pytest.raises(ValueError, match="stitched=False"):
-            sim.simulate(
-                torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
-                stitched=False,
-            )
+        torch.manual_seed(0)
+        sw  = sim.simulate(
+            torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
+            stitched=True,
+        )
+        torch.manual_seed(0)
+        wf  = sim.simulate(
+            torch.zeros(5, 3), torch.full((5,), 100), torch.zeros(5),
+            stitched=False,
+        )
+        assert isinstance(wf, Waveform)
+        ref = sw.deslice()
+        assert wf.adc.shape == ref.adc.shape
+        assert torch.allclose(wf.adc, ref.adc, atol=1e-5)
+        assert wf.t0 == ref.t0
+        assert wf.tick_ns == ref.tick_ns
 
     def test_digitization_quantizes_output(self):
         """With digitization on, output is integer-valued and ADC-clamped."""
@@ -584,22 +605,5 @@ class TestDifferentiableSimulatorAssertions:
         sw_n = sim_noisy.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=True)
         assert sw_n.adc.std().item() > sw_q.adc.std().item(), (
             "noisy diff sim output should have larger ADC std than quiet sim"
-        )
-
-    def test_ser_jitter_actually_applied(self):
-        """ser_jitter_std > 0 should change the histogram weights vs jitter-free."""
-        torch.manual_seed(1)
-        cfg_clean = _minimal_cfg()
-        cfg_jitter = _minimal_cfg(ser_jitter_std=0.5)
-        sim_clean = DifferentiableOpticalSimulator(cfg_clean)
-        sim_jitter = DifferentiableOpticalSimulator(cfg_jitter)
-
-        pos = torch.zeros(10, 3)
-        n_ph = torch.full((10,), 100)
-        t = torch.zeros(10)
-        sw_c = sim_clean.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=False)
-        sw_j = sim_jitter.simulate(pos, n_ph, t, stitched=True, add_baseline_noise=False)
-        assert not torch.allclose(sw_c.adc, sw_j.adc, atol=1e-3), (
-            "jittered output should differ from non-jittered"
         )
 

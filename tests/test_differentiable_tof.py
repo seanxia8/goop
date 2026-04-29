@@ -216,6 +216,101 @@ class TestHistogramEquivalence:
 
 
 # ---------------------------------------------------------------------------
+# Regression: sample(return_histogram=True) must conserve photons across all
+# yield scales — broken by an earlier fractional-deposition + int32-truncate
+# implementation that lost up to 97% of photons at low yields.
+# ---------------------------------------------------------------------------
+
+
+class TestSampleHistogramPhotonConservation:
+    """`sample(return_histogram=True)` is a Poisson-sampled discrete histogram.
+    Averaged over many seeds, its total count must match the expected yield
+    from `histogram_pdf` at every realistic per-source photon count."""
+
+    @pytest.mark.parametrize("n_ph_each", [10, 100, 1000, 10000])
+    def test_total_yield_matches_pdf(self, n_ph_each):
+        torch.manual_seed(0)
+        diff_sampler = _make_synth_library(cls=DifferentiableTOFSampler)
+        stoch_sampler = _make_synth_library(cls=TOFSampler)
+
+        n_pos = 20
+        pos = torch.zeros(n_pos, 3)
+        n_ph = torch.full((n_pos,), float(n_ph_each))
+        t_step = torch.zeros(n_pos)
+
+        # Deterministic expected total from the diff PDF path.
+        h_pdf = diff_sampler.histogram_pdf(
+            pos, n_ph, t_step, tick_ns=1.0, n_bins=50, t0_ref=-5.0,
+        )
+        expected = h_pdf.sum().item()
+
+        # Average sample(return_histogram=True) total over many seeds.
+        n_seeds = 50
+        total = 0.0
+        for seed in range(n_seeds):
+            torch.manual_seed(seed)
+            hs = stoch_sampler.sample(
+                pos, n_ph, t_step=t_step, return_histogram=True,
+                t_max_ns=50.0, tick_ns=1.0,
+            )
+            total += hs.sum().item()
+        avg = total / n_seeds
+
+        # Tolerance: ±3 standard errors of a Poisson(expected) mean over
+        # n_seeds throws -> 3 * sqrt(expected/n_seeds) / expected. Plus a 2%
+        # floor for finite-sample noise on small expected values.
+        sigma = (expected / n_seeds) ** 0.5
+        tol = max(3.0 * sigma / expected, 0.02)
+        rel_err = abs(avg - expected) / expected
+        assert rel_err < tol, (
+            f"n_ph={n_ph_each}: expected={expected:.2f}, avg={avg:.2f}, "
+            f"rel_err={rel_err:.4f} > tol={tol:.4f}"
+        )
+
+    def test_matches_raw_sampling_total(self):
+        """`sample(return_histogram=True)` and `sample(return_histogram=False)`
+        should produce the same total photon count distribution (both are
+        Poisson(expected) per pair)."""
+        torch.manual_seed(0)
+        sampler = _make_synth_library(cls=TOFSampler)
+
+        pos = torch.zeros(20, 3)
+        n_ph = torch.full((20,), 500.0)  # moderate yield: ~30/pair on average
+        t_step = torch.zeros(20)
+
+        n_seeds = 50
+        tot_hist, tot_raw = 0.0, 0.0
+        for seed in range(n_seeds):
+            torch.manual_seed(seed)
+            hs = sampler.sample(
+                pos, n_ph, t_step=t_step, return_histogram=True,
+                t_max_ns=50.0, tick_ns=1.0,
+            )
+            tot_hist += hs.sum().item()
+            torch.manual_seed(seed)
+            times, _, _ = sampler.sample(pos, n_ph, t_step=t_step)
+            tot_raw += times.numel()
+
+        avg_hist = tot_hist / n_seeds
+        avg_raw = tot_raw / n_seeds
+        rel = abs(avg_hist - avg_raw) / avg_raw
+        assert rel < 0.03, (
+            f"hist avg={avg_hist:.2f}, raw avg={avg_raw:.2f}, rel diff={rel:.4f}"
+        )
+
+    def test_returns_integer_dtype(self):
+        """The histogram is a count of discrete photons — output must be int."""
+        sampler = _make_synth_library(cls=TOFSampler)
+        torch.manual_seed(0)
+        hs = sampler.sample(
+            torch.zeros(5, 3), torch.full((5,), 100.0), t_step=torch.zeros(5),
+            return_histogram=True, t_max_ns=50.0, tick_ns=1.0,
+        )
+        assert hs.dtype == torch.int32
+        assert (hs >= 0).all()
+
+
+# ---------------------------------------------------------------------------
 # 4. Gradient flow through n_photons (and pos via trilinear interp)
 # ---------------------------------------------------------------------------
 
@@ -377,83 +472,28 @@ class TestDiffSimIntegration:
 
 
 # ---------------------------------------------------------------------------
-# 6. Streaming-histogram path: same math as sample_pdf, smaller peak memory
+# 6. histogram_pdf path: gradient flow through n_photons
 # ---------------------------------------------------------------------------
 
 
-class TestStreamingHistogram:
-    """``cfg.streaming=True`` must produce the same ADC content as the default
-    ``sample_pdf`` + ``from_photons`` path on identical inputs.
+class TestDiffSimGradient:
+    """Backward through the diff simulator (which uses `histogram_pdf` with
+    per-chunk gradient checkpointing) must reach `n_photons`.
     """
 
-    def _make_cfgs(self, sampler, *, baseline_noise_std=0.0, stream_chunk_size=7):
-        """Build paired configs identical except for the ``streaming`` flag."""
+    def _make_cfg(self, sampler, *, baseline_noise_std=0.0, stream_chunk_size=7):
         ser = SERKernel(duration_ns=200.0, device=DEVICE)
-
-        def _build(streaming):
-            return OpticalSimConfig(
-                tof_sampler=sampler, delays=Delays([]),
-                kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
-                device="cpu", tick_ns=1.0, gain=-1.0,
-                baseline_noise_std=baseline_noise_std,
-                streaming=streaming,
-                stream_chunk_size=stream_chunk_size,
-            )
-        return _build(False), _build(True)
-
-    @staticmethod
-    def _align(adc, t0, tick_ns, t_start, n_bins):
-        """Pad ``adc`` onto the (t_start, n_bins) reference grid."""
-        import torch.nn.functional as F
-        n_ch = adc.shape[0]
-        offset = int(round((t0 - t_start) / tick_ns))
-        out = torch.zeros(n_ch, n_bins, device=adc.device, dtype=adc.dtype)
-        src_lo = max(0, -offset)
-        dst_lo = max(0, offset)
-        n_copy = min(adc.shape[1] - src_lo, n_bins - dst_lo)
-        if n_copy > 0:
-            out[:, dst_lo:dst_lo + n_copy] = adc[:, src_lo:src_lo + n_copy]
-        return out
-
-    def test_streaming_matches_sample_pdf(self):
-        """ADC output must match between ``streaming=False`` and ``streaming=True``."""
-        sampler = _make_synth_library(cls=DifferentiableTOFSampler)
-        cfg_def, cfg_str = self._make_cfgs(sampler)
-
-        sim_def = DifferentiableOpticalSimulator(cfg_def)
-        sim_str = DifferentiableOpticalSimulator(cfg_str)
-
-        torch.manual_seed(0)
-        pos = torch.linspace(-30, 30, 20).unsqueeze(-1).expand(-1, 3).contiguous()
-        n_ph = torch.full((20,), 200.0)
-        t_step = torch.linspace(0.0, 5.0, 20)
-
-        sw_def = sim_def.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False)
-        wf_def = sw_def.deslice()
-        wf_str = sim_str.simulate(pos, n_ph, t_step, stitched=True, add_baseline_noise=False).deslice()
-
-        # Align both onto a common time grid spanning the union.
-        tick = wf_def.tick_ns
-        assert abs(wf_str.tick_ns - tick) < 1e-9
-        t_start = min(wf_def.t0, wf_str.t0)
-        n_bins = max(
-            int(round((wf_def.t0 - t_start) / tick)) + wf_def.adc.shape[1],
-            int(round((wf_str.t0 - t_start) / tick)) + wf_str.adc.shape[1],
+        return OpticalSimConfig(
+            tof_sampler=sampler, delays=Delays([]),
+            kernel=Response(kernels=[ser], tick_ns=1.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-1.0,
+            baseline_noise_std=baseline_noise_std,
+            stream_chunk_size=stream_chunk_size,
         )
-        adc_def = self._align(wf_def.adc, wf_def.t0, tick, t_start, n_bins)
-        adc_str = self._align(wf_str.adc, wf_str.t0, tick, t_start, n_bins)
-
-        diff = (adc_def - adc_str).abs()
-        scale = adc_def.abs().max().clamp(min=1e-6)
-        rel_err = (diff.max() / scale).item()
-        # Should be essentially identical up to FFT/scatter float noise.
-        assert rel_err < 1e-3, f"streaming adc diverges from sample_pdf adc by rel_err={rel_err}"
 
     def test_streaming_grad_through_n_photons(self):
-        """Backward through ``streaming=True`` reaches ``n_photons``."""
         sampler = _make_synth_library(cls=DifferentiableTOFSampler)
-        _, cfg_str = self._make_cfgs(sampler)
-        sim = DifferentiableOpticalSimulator(cfg_str)
+        sim = DifferentiableOpticalSimulator(self._make_cfg(sampler))
 
         pos = torch.zeros(10, 3)
         n_ph = torch.full((10,), 100.0, requires_grad=True)
@@ -465,3 +505,30 @@ class TestStreamingHistogram:
         assert n_ph.grad is not None
         assert torch.isfinite(n_ph.grad).all()
         assert n_ph.grad.abs().max().item() > 0
+
+
+class TestTimeGroupSegments:
+    """``time_group_segments`` is the input-side helper used by the
+    differentiable streaming path. The stochastic simulator does not call it.
+    """
+
+    def test_splits_at_gaps(self):
+        from goop.diff_simulator import time_group_segments
+        # two well-separated bursts: [1, 2, 3] and [1000, 1001]; gap of 997 ns
+        t = torch.tensor([1.0, 2.0, 3.0, 1000.0, 1001.0])
+        groups = time_group_segments(t, gap_threshold_ns=100.0)
+        assert len(groups) == 2
+        # every original index appears exactly once across the groups
+        assert sorted(torch.cat(groups).tolist()) == [0, 1, 2, 3, 4]
+
+    def test_no_gaps_returns_single_group(self):
+        from goop.diff_simulator import time_group_segments
+        t = torch.tensor([0.0, 5.0, 10.0, 15.0])  # max gap 5 ns < threshold
+        groups = time_group_segments(t, gap_threshold_ns=100.0)
+        assert len(groups) == 1
+        assert sorted(groups[0].tolist()) == [0, 1, 2, 3]
+
+    def test_empty_input_returns_empty_list(self):
+        from goop.diff_simulator import time_group_segments
+        t = torch.zeros(0)
+        assert time_group_segments(t, gap_threshold_ns=100.0) == []

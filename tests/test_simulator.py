@@ -378,6 +378,224 @@ class TestDeslice:
 
 
 # ---------------------------------------------------------------------------
+# SlicedWaveform.align: per-active-channel rewrite onto the global window
+# ---------------------------------------------------------------------------
+
+
+def _make_align_sw(adc_chunks, t0_chunks, pmt_chunks, *, tick_ns=1.0, n_channels=4):
+    """Build a SlicedWaveform from a list of per-chunk (adc, t0_ns, pmt_id)."""
+    flat_adc = torch.cat(adc_chunks) if adc_chunks else torch.zeros(0)
+    lens = torch.tensor([c.numel() for c in adc_chunks], dtype=torch.long)
+    offsets = torch.cat([torch.zeros(1, dtype=torch.long), lens.cumsum(0)])
+    return SlicedWaveform(
+        adc=flat_adc.to(torch.float32),
+        offsets=offsets,
+        t0_ns=torch.tensor(t0_chunks, dtype=torch.float32),
+        pmt_id=torch.tensor(pmt_chunks, dtype=torch.long),
+        tick_ns=float(tick_ns), n_channels=n_channels,
+    )
+
+
+class TestSlicedWaveformAlign:
+    """Pin SlicedWaveform.align()'s contract: per-active-channel rewrite onto
+    the global window with `fill` in dead regions."""
+
+    def test_align_matches_reference(self):
+        # Three chunks across two active PMTs, with a gap on PMT 1.
+        # PMT 0: [t0=10, 3 bins=[1,2,3]] then [t0=15, 2 bins=[4,5]]
+        # PMT 2: [t0=12, 4 bins=[7,8,9,10]]
+        # global window = [10, 17] -> 7 bins, n_active = 2
+        # Expected canvas (fill=-1.0):
+        #   row 0 (PMT 0): [1,2,3,-1,-1,4,5]
+        #   row 1 (PMT 2): [-1,-1,7,8,9,10,-1]
+        sw = _make_align_sw(
+            adc_chunks=[
+                torch.tensor([1.0, 2.0, 3.0]),
+                torch.tensor([4.0, 5.0]),
+                torch.tensor([7.0, 8.0, 9.0, 10.0]),
+            ],
+            t0_chunks=[10.0, 15.0, 12.0],
+            pmt_chunks=[0, 0, 2],
+            tick_ns=1.0, n_channels=4,
+        )
+        aligned = sw.align(fill=-1.0)
+
+        assert aligned.n_chunks == 2  # one per active PMT
+        assert aligned.pmt_id.tolist() == [0, 2]
+        assert aligned.tick_ns == 1.0
+        # Both rows share the global t0 = 10.
+        assert torch.equal(aligned.t0_ns, torch.tensor([10.0, 10.0]))
+        # Each row spans 7 bins; offsets are [0, 7, 14].
+        assert aligned.offsets.tolist() == [0, 7, 14]
+
+        expected = torch.tensor([
+            1.0, 2.0, 3.0, -1.0, -1.0, 4.0, 5.0,
+            -1.0, -1.0, 7.0, 8.0, 9.0, 10.0, -1.0,
+        ])
+        assert torch.allclose(aligned.adc, expected)
+
+    def test_align_idempotent_for_aligned_input(self):
+        # Already aligned: one chunk per active PMT, common t0, no gaps.
+        sw = _make_align_sw(
+            adc_chunks=[
+                torch.tensor([1.0, 2.0, 3.0]),
+                torch.tensor([4.0, 5.0, 6.0]),
+            ],
+            t0_chunks=[5.0, 5.0],
+            pmt_chunks=[1, 3],
+            tick_ns=1.0, n_channels=4,
+        )
+        aligned = sw.align(fill=0.0)
+        assert torch.equal(aligned.pmt_id, sw.pmt_id)
+        assert torch.equal(aligned.t0_ns, sw.t0_ns)
+        assert torch.equal(aligned.offsets, sw.offsets)
+        assert torch.allclose(aligned.adc, sw.adc)
+
+    def test_align_empty(self):
+        sw = SlicedWaveform(
+            adc=torch.zeros(0, dtype=torch.float32),
+            offsets=torch.zeros(1, dtype=torch.long),
+            t0_ns=torch.zeros(0, dtype=torch.float32),
+            pmt_id=torch.zeros(0, dtype=torch.long),
+            tick_ns=1.0, n_channels=4,
+        )
+        aligned = sw.align(fill=0.0)
+        assert aligned.n_chunks == 0
+        assert aligned.adc.numel() == 0
+        assert aligned.n_channels == 4
+        assert aligned.tick_ns == 1.0
+
+    def test_align_differentiable(self):
+        """Gradients on input adc must flow through align to its output adc."""
+        adc = torch.tensor([1.0, 2.0, 3.0, 4.0, 5.0, 7.0, 8.0, 9.0, 10.0], requires_grad=True)
+        sw = SlicedWaveform(
+            adc=adc,
+            offsets=torch.tensor([0, 3, 5, 9], dtype=torch.long),
+            t0_ns=torch.tensor([10.0, 15.0, 12.0]),
+            pmt_id=torch.tensor([0, 0, 2], dtype=torch.long),
+            tick_ns=1.0, n_channels=4,
+        )
+        aligned = sw.align(fill=0.0)
+        # Output must remain part of the autograd graph.
+        assert aligned.adc.requires_grad
+        # Loss = Σ adc_out² → gradient w.r.t. each input element is 2 * adc[i],
+        # because scatter has a 1:1 mapping (no overlapping chunks here).
+        aligned.adc.pow(2).sum().backward()
+        assert adc.grad is not None
+        assert torch.isfinite(adc.grad).all()
+        assert torch.allclose(adc.grad, 2.0 * adc.detach())
+
+
+# ---------------------------------------------------------------------------
+# Waveform.align_to / align_with: pad/crop dense waveforms onto a target grid
+# ---------------------------------------------------------------------------
+
+
+def _make_wf(adc_rows, t0, tick_ns=1.0, n_channels=None):
+    """Build a dense Waveform from a list of per-channel rows (lists of floats)."""
+    adc = torch.tensor(adc_rows, dtype=torch.float32)
+    return Waveform(
+        adc=adc, t0=float(t0), tick_ns=float(tick_ns),
+        n_channels=n_channels if n_channels is not None else adc.shape[0],
+    )
+
+
+class TestWaveformAlignTo:
+    """Pin Waveform.align_to(): pad/crop onto an arbitrary (t0, n_bins) grid."""
+
+    def test_identity(self):
+        wf = _make_wf([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], t0=10.0)
+        out = wf.align_to(t0=10.0, n_bins=3)
+        assert out.t0 == 10.0
+        assert out.tick_ns == wf.tick_ns
+        assert out.n_channels == wf.n_channels
+        assert torch.allclose(out.adc, wf.adc)
+
+    def test_pad_front(self):
+        # Target t0 is 2 ticks earlier -> 2 fill bins prepended.
+        wf = _make_wf([[1.0, 2.0, 3.0]], t0=10.0)
+        out = wf.align_to(t0=8.0, n_bins=5, fill=-1.0)
+        assert out.t0 == 8.0
+        assert torch.allclose(
+            out.adc, torch.tensor([[-1.0, -1.0, 1.0, 2.0, 3.0]])
+        )
+
+    def test_pad_back(self):
+        # Same t0 but a longer grid -> trailing fill.
+        wf = _make_wf([[1.0, 2.0, 3.0]], t0=10.0)
+        out = wf.align_to(t0=10.0, n_bins=5, fill=0.0)
+        assert torch.allclose(
+            out.adc, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0]])
+        )
+
+    def test_crop_front(self):
+        # Target t0 is past the source's first bin -> leading samples dropped.
+        wf = _make_wf([[1.0, 2.0, 3.0, 4.0]], t0=10.0)
+        out = wf.align_to(t0=12.0, n_bins=2)
+        assert out.t0 == 12.0
+        assert torch.allclose(out.adc, torch.tensor([[3.0, 4.0]]))
+
+    def test_crop_tail(self):
+        # Smaller n_bins than source -> trailing samples dropped.
+        wf = _make_wf([[1.0, 2.0, 3.0, 4.0]], t0=10.0)
+        out = wf.align_to(t0=10.0, n_bins=2)
+        assert torch.allclose(out.adc, torch.tensor([[1.0, 2.0]]))
+
+    def test_preserves_dtype_and_device(self):
+        adc = torch.tensor([[1.0, 2.0, 3.0]], dtype=torch.float64)
+        wf = Waveform(adc=adc, t0=0.0, tick_ns=1.0, n_channels=1)
+        out = wf.align_to(t0=-1.0, n_bins=5)
+        assert out.adc.dtype == torch.float64
+        assert out.adc.device == adc.device
+
+    def test_differentiable(self):
+        """Gradients must flow back to the source adc through align_to."""
+        adc = torch.tensor([[1.0, 2.0, 3.0]], requires_grad=True)
+        wf = Waveform(adc=adc, t0=10.0, tick_ns=1.0, n_channels=1)
+        out = wf.align_to(t0=8.0, n_bins=5, fill=0.0)
+        assert out.adc.requires_grad
+        out.adc.pow(2).sum().backward()
+        assert torch.allclose(adc.grad, 2.0 * adc.detach())
+
+
+class TestWaveformAlignWith:
+    """Pin Waveform.align_with(): place two waveforms on their union grid."""
+
+    def test_disjoint_windows(self):
+        # wf_a: t0=10, [1,2,3]   wf_b: t0=15, [7,8]
+        # Union grid: t0=10, n_bins = max(0+3, 5+2) = 7
+        wf_a = _make_wf([[1.0, 2.0, 3.0]], t0=10.0)
+        wf_b = _make_wf([[7.0, 8.0]], t0=15.0)
+        a, b = wf_a.align_with(wf_b, fill=0.0)
+        assert a.t0 == 10.0 and b.t0 == 10.0
+        assert a.adc.shape == b.adc.shape == (1, 7)
+        assert torch.allclose(
+            a.adc, torch.tensor([[1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 0.0]])
+        )
+        assert torch.allclose(
+            b.adc, torch.tensor([[0.0, 0.0, 0.0, 0.0, 0.0, 7.0, 8.0]])
+        )
+        # Energy preserved with fill=0.
+        assert torch.isclose(a.adc.sum(), wf_a.adc.sum())
+        assert torch.isclose(b.adc.sum(), wf_b.adc.sum())
+
+    def test_overlapping_windows(self):
+        # wf_a: t0=10, 4 bins ; wf_b: t0=12, 3 bins -> union is t0=10, n_bins=5
+        wf_a = _make_wf([[1.0, 2.0, 3.0, 4.0]], t0=10.0)
+        wf_b = _make_wf([[7.0, 8.0, 9.0]], t0=12.0)
+        a, b = wf_a.align_with(wf_b)
+        assert a.adc.shape == b.adc.shape == (1, 5)
+        assert torch.allclose(a.adc, torch.tensor([[1.0, 2.0, 3.0, 4.0, 0.0]]))
+        assert torch.allclose(b.adc, torch.tensor([[0.0, 0.0, 7.0, 8.0, 9.0]]))
+
+    def test_tick_ns_mismatch_raises(self):
+        wf_a = _make_wf([[1.0, 2.0]], t0=0.0, tick_ns=1.0)
+        wf_b = _make_wf([[1.0, 2.0]], t0=0.0, tick_ns=2.0)
+        with pytest.raises(ValueError, match="tick_ns mismatch"):
+            wf_a.align_with(wf_b)
+
+
+# ---------------------------------------------------------------------------
 # Closure tests: slice <-> deslice roundtrip
 # ---------------------------------------------------------------------------
 
