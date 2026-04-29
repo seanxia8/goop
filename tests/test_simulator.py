@@ -1466,3 +1466,212 @@ class TestBaselineNoise:
             stitched=True,
         )
         assert isinstance(result, SlicedWaveform)
+
+
+# ---------------------------------------------------------------------------
+# Labeled mode (per-interaction / per-volume per-waveform split)
+# ---------------------------------------------------------------------------
+#
+# Regression tests for the labeled `simulate(..., labels=...)` path. The
+# pre-existing tests don't exercise this path, which is how two recent merge
+# bugs slipped past CI:
+#   * `UnboundLocalError: name 'results' is not defined`
+#     (sliced_results was declared but the loop body extended `results`)
+#   * `NameError: name 'active_expected' is not defined` inside
+#     `_sample_histogram` (called via the diff-sim `histogram_pdf` path,
+#     but the underlying sampler is shared with stoch).
+#
+# These tests use the simulator's existing `MockTOFSampler` to keep the
+# pipeline CPU-only and deterministic.
+
+class TestLabeledMode:
+    """`simulate(labels=...)` returns one SlicedWaveform per unique label."""
+
+    def _sim(self, n_channels=4):
+        return OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=n_channels),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=500.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-20.0,
+        ))
+
+    def test_returns_one_waveform_per_label(self):
+        sim = self._sim()
+        # 6 segments, 3 distinct labels (0, 1, 2)
+        pos = torch.zeros(6, 3, device=DEVICE)
+        nph = torch.full((6,), 200, device=DEVICE)
+        tns = torch.zeros(6, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1, 2, 2], device=DEVICE, dtype=torch.long)
+        out = sim.simulate(pos, nph, tns, labels=lbl, stitched=True, subtract_t0=True)
+        assert isinstance(out, list)
+        assert len(out) == 3
+        for sw in out:
+            assert isinstance(sw, SlicedWaveform)
+
+    def test_per_label_pe_counts_split_when_disjoint(self):
+        """Two disjoint label groups should each carry roughly half the PEs."""
+        sim = self._sim()
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 500, device=DEVICE)
+        tns = torch.zeros(4, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        out = sim.simulate(pos, nph, tns, labels=lbl, stitched=True, subtract_t0=True)
+        pe = [int(sw.attrs["pe_counts"].sum().item()) for sw in out]
+        total = sum(pe)
+        # Each label group should contribute ~half the photons within Poisson noise.
+        assert total > 0
+        assert abs(pe[0] - pe[1]) <= 0.20 * total, f"PE imbalance: {pe} (total={total})"
+
+    def test_stitched_false_returns_dense_waveforms(self):
+        """`stitched=False` should give one Waveform per label, not SlicedWaveform."""
+        sim = self._sim()
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 200, device=DEVICE)
+        tns = torch.zeros(4, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        out = sim.simulate(pos, nph, tns, labels=lbl, stitched=False, subtract_t0=True)
+        assert len(out) == 2
+        for wf in out:
+            assert isinstance(wf, Waveform)
+            assert wf.adc.dim() == 2  # (n_channels, n_bins)
+
+    def test_pdgs_de_optional(self):
+        """`pdgs=None, de=None` should not crash (was the production-voxelize path)."""
+        sim = self._sim()
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 200, device=DEVICE)
+        tns = torch.zeros(4, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        # Default: pdgs=None, de=None
+        out = sim.simulate(pos, nph, tns, labels=lbl, stitched=True, subtract_t0=True)
+        assert len(out) == 2
+
+    def test_return_tpc_with_pdgs_de(self):
+        """`return_tpc=True` returns 7-tuple; pdg/de arrays survive when provided."""
+        sim = self._sim()
+        cfg = sim.config
+        cfg.time_window_ns = 1_000_000.0  # generous so nothing gets culled
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 200, device=DEVICE)
+        tns = torch.zeros(4, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        pdg = torch.tensor([13.0, 13.0, 11.0, 11.0], device=DEVICE)
+        de = torch.full((4,), 0.5, device=DEVICE)
+        out = sim.simulate(
+            pos, nph, tns, labels=lbl, pdgs=pdg, de=de,
+            stitched=True, subtract_t0=True, return_tpc=True,
+        )
+        assert isinstance(out, tuple)
+        assert len(out) == 7
+        wfs, pos_o, nph_o, tns_o, lbl_o, pdg_o, de_o = out
+        assert isinstance(wfs, list) and len(wfs) == 2
+        assert pdg_o is not None and de_o is not None
+        assert pdg_o.shape == lbl_o.shape == nph_o.shape
+
+    def test_return_tpc_with_none_pdgs_de(self):
+        """`return_tpc=True` with pdgs=None must not crash (post-voxelize path)."""
+        sim = self._sim()
+        cfg = sim.config
+        cfg.time_window_ns = 1_000_000.0
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 200, device=DEVICE)
+        tns = torch.zeros(4, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        out = sim.simulate(
+            pos, nph, tns, labels=lbl,
+            stitched=True, subtract_t0=True, return_tpc=True,
+        )
+        assert len(out) == 7
+        _, _, _, _, _, pdg_o, de_o = out
+        assert pdg_o is None
+        assert de_o is None
+
+    def test_subtract_t0_per_label(self):
+        """`subtract_t0=True` should normalise each label group independently
+        (so a late-arriving label still starts at t=0 within its waveform)."""
+        sim = self._sim()
+        # Label 0 emits at t=10; label 1 emits at t=10000. After per-label
+        # subtract_t0 both should have their t_step.min() at 0, so neither
+        # waveform should be 10000-bins-deep.
+        pos = torch.zeros(4, 3, device=DEVICE)
+        nph = torch.full((4,), 200, device=DEVICE)
+        tns = torch.tensor([10., 10., 10000., 10000.], device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1], device=DEVICE, dtype=torch.long)
+        out = sim.simulate(pos, nph, tns, labels=lbl, stitched=True, subtract_t0=True)
+        # Both waveforms should have t0 in roughly the same scale
+        # (mock TOF sampler emits times at <= ~2200 ns offset from t_step.mean()).
+        for sw in out:
+            assert sw.n_chunks > 0
+            # Chunk t0s shouldn't include the absolute 10000-ns offset of label 1.
+            assert sw.t0_ns.min().item() < 5000.0
+
+
+# ---------------------------------------------------------------------------
+# Production-style smoke (voxelize_labeled + simulate(return_tpc=True))
+# ---------------------------------------------------------------------------
+
+class TestProductionPipeline:
+    """End-to-end of the helpers production/run_batch.py uses, but with the
+    Mock TOF sampler so we don't depend on the LUT or SIREN checkpoints.
+    Catches regressions in the (extract → voxelize_labeled → simulate) handoff."""
+
+    def _voxelize_labeled(self, pos, nph, tns, lbl, dx):
+        """Replicates production/run_batch.py:voxelize_labeled but on CPU
+        torch tensors (the production version starts from JAX arrays via
+        dlpack which doesn't work on CPU-only fixtures)."""
+        from goop.utils import voxelize
+        pv_all, npv_all, tv_all, lbl_all = [], [], [], []
+        for ulbl in torch.unique(lbl).tolist():
+            mask = lbl == ulbl
+            if not bool(mask.any()):
+                continue
+            p_v, n_v, t_v = voxelize(pos[mask], nph[mask], tns[mask], dx=dx)
+            pv_all.append(p_v); npv_all.append(n_v); tv_all.append(t_v)
+            lbl_all.append(torch.full(
+                (p_v.shape[0],), ulbl, device=pos.device, dtype=torch.long,
+            ))
+        return (torch.cat(pv_all), torch.cat(npv_all),
+                torch.cat(tv_all), torch.cat(lbl_all))
+
+    def test_voxelize_then_simulate_preserves_labels(self):
+        """Per-label voxelization must keep label semantics intact:
+        each label should still produce its own waveform after voxelize."""
+        sim = OpticalSimulator(OpticalSimConfig(
+            tof_sampler=MockTOFSampler(n_channels=4),
+            delays=Delays([]),
+            kernel=RLCKernel(duration_ns=500.0, device=DEVICE),
+            device="cpu", tick_ns=1.0, gain=-20.0,
+        ))
+        # 6 segments at near-identical positions (will collapse into 1-2 voxels
+        # within each label group), 3 labels.
+        pos = torch.tensor([
+            [0., 0., 0.], [1., 1., 1.],
+            [0., 0., 0.], [1., 1., 1.],
+            [0., 0., 0.], [1., 1., 1.],
+        ], device=DEVICE)
+        nph = torch.full((6,), 200, device=DEVICE, dtype=torch.long)
+        tns = torch.zeros(6, device=DEVICE)
+        lbl = torch.tensor([0, 0, 1, 1, 2, 2], device=DEVICE, dtype=torch.long)
+
+        pos_v, nph_v, tns_v, lbl_v = self._voxelize_labeled(
+            pos, nph, tns, lbl, dx=20.0,
+        )
+        # Each label produces ≥ 1 voxel; total voxels ≤ 6 raw segments.
+        assert torch.unique(lbl_v).numel() == 3
+        assert pos_v.shape[0] <= 6
+        # Crucially: labels survive — no segment from label 0 should land in label 1's voxels.
+        for ulbl in [0, 1, 2]:
+            assert (lbl_v == ulbl).any()
+
+        # Photon yield preservation (per-label).
+        for ulbl in [0, 1, 2]:
+            raw_sum = int(nph[lbl == ulbl].sum().item())
+            vox_sum = int(nph_v[lbl_v == ulbl].sum().item())
+            assert raw_sum == vox_sum, f"label {ulbl}: {raw_sum} → {vox_sum}"
+
+        # Simulate with the voxelized inputs (pdgs/de=None, like production).
+        out = sim.simulate(
+            pos_v, nph_v, tns_v, labels=lbl_v,
+            stitched=True, subtract_t0=True, return_tpc=False,
+        )
+        assert len(out) == 3

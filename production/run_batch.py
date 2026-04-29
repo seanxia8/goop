@@ -502,6 +502,19 @@ def main():
 
                     pos_mm, n_ph, t_ns, labels, pdgs, des, total_segs = extract_goop_inputs(
                         filled, cfg, label_key)
+
+                    # Snapshot the raw (pre-voxelization) per-segment arrays
+                    # as numpy. These are the ground-truth TPC inputs that will
+                    # be saved alongside the simulated waveforms — even when
+                    # voxelization is enabled, the file holds original segment
+                    # granularity (with pdg / dE preserved).
+                    raw_pos = np.asarray(pos_mm)
+                    raw_nph = np.asarray(n_ph)
+                    raw_tns = np.asarray(t_ns)
+                    raw_lbl = np.asarray(labels)
+                    raw_pdg = np.asarray(pdgs)
+                    raw_des = np.asarray(des)
+
                     n_after = total_segs
                     t_vox = 0.0
                     if args.voxel_dx > 0:
@@ -509,16 +522,18 @@ def main():
                         pos_mm, n_ph, t_ns, labels = voxelize_labeled(
                             pos_mm, n_ph, t_ns, labels, args.voxel_dx,
                         )
-                        # pdg/de are per-segment; drop them after voxelization
-                        # since voxels merge segments with potentially different pdgs.
+                        # pdg/de are per-segment; drop them on the simulator
+                        # path after voxelization since voxels merge segments
+                        # with potentially different pdgs. The raw_* snapshots
+                        # above keep the unmerged truth for saving.
                         pdgs, des = None, None
                         t_vox = time.time() - tv0
                         n_after = pos_mm.shape[0]
                     # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
                     t0 = time.time()
-                    waveforms, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new = goop_sim.simulate(
+                    waveforms = goop_sim.simulate(
                         pos_mm, n_ph, t_ns, labels=labels, pdgs=pdgs, de=des,
-                        stitched=True, subtract_t0=True, return_tpc=True)
+                        stitched=True, subtract_t0=True, return_tpc=False)
 
                     # 4.1 - Align Waveforms
                     if should_align:
@@ -537,7 +552,8 @@ def main():
                     # 4. GPU → CPU transfer + save (serial or queued)
                     t0 = time.time()
                     waveforms_cpu = waveforms_to_cpu(waveforms)
-                    item = (event_key, waveforms_cpu, evt_idx, pos_new, n_ph_new, t_ns_new, labels_new, des_new, pdg_new)
+                    item = (event_key, waveforms_cpu, evt_idx,
+                            raw_pos, raw_nph, raw_tns, raw_lbl, raw_des, raw_pdg)
 
                     if num_workers > 0:
                         save_queue.put(item)
@@ -559,7 +575,8 @@ def main():
                           f"{t_total:>5.1f}s")
 
                     del deposits, filled, waveforms, waveforms_cpu
-                    del pos_mm, n_ph, t_ns, labels, pdgs, des, pos_new, n_ph_new, t_ns_new, labels_new, pdg_new, des_new
+                    del pos_mm, n_ph, t_ns, labels, pdgs, des
+                    del raw_pos, raw_nph, raw_tns, raw_lbl, raw_pdg, raw_des
                     gc.collect()
 
             # Wait for workers to finish
