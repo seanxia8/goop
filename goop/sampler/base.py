@@ -272,39 +272,41 @@ class PCATOFSampler(TOFSamplerBase):
             v, t0, coeffs = self._lookup(pos_lookup)  # (C,P), (C,P), (C,P,K)
 
             expected = (v * chunk_scale.unsqueeze(1) * self._pmt_qe).clamp_(min=0)  # (C, P)
-            counts = torch.poisson(expected)       # (C, P) Poisson-sampled integer counts
-            active_mask = counts > 0.5             # (C, P) bool — pairs with ≥1 photon
+            active_mask = expected > 0.5
 
             n_active = active_mask.sum().item()    # M = number of active pairs
             if n_active == 0:
                 continue
 
-            active_counts = counts[active_mask]    # (M,)
-            active_coeffs = coeffs[active_mask]    # (M, K)
-            active_t0 = t0[active_mask]            # (M,)
+            counts_q = torch.poisson(expected.unsqueeze(-1) * du)  # (C, P, Q)
+            has_photon = counts_q.sum(-1) > 0                        # (C, P)
+            if not has_photon.any():
+                continue
+
+            counts_q      = counts_q[has_photon]      # (M', Q)
+            active_coeffs = coeffs[has_photon]         # (M', K)
+            active_t0     = t0[has_photon]             # (M',)
 
             # assign full-detector PMT channel ids (0..2P-1)
             pmt_offset = torch.where(on_pos_side, P, 0).unsqueeze(1).expand(C, P)  # (C, P)
             pmt_base = torch.arange(P, device=self._device).unsqueeze(0).expand(C, -1)  # (C, P)
-            active_pmt = (pmt_base + pmt_offset)[active_mask]  # (M,) channel ids in [0, 2P)
+            active_pmt = (pmt_base + pmt_offset)[has_photon]         # (M',)
 
             q_abs = self._quantile_times(active_coeffs, active_t0)  # (M, Q) absolute quantile times
 
             if chunk_t is not None:
-                t_expanded = chunk_t.unsqueeze(1).expand(C, P)       # (C, P)
-                active_t_emit = t_expanded[active_mask]              # (M,)
-                q_abs = q_abs + active_t_emit.unsqueeze(-1)          # (M, Q) shift by emission time
+                t_expanded = chunk_t.unsqueeze(1).expand(C, P)             # (C, P)
+                active_t_emit = t_expanded[has_photon]        # (M',)
+                q_abs = q_abs + active_t_emit.unsqueeze(-1)                # (M', Q) shift by emission time
 
             # convert quantile times to histogram bins and scatter-add
             bin_idx = (q_abs * inv_tick).long()                      # (M, Q) time bin indices
             in_window = (bin_idx >= 0) & (bin_idx < n_bins)          # (M, Q) bool — in time range
             bin_idx.clamp_(0, n_bins - 1)                            # (M, Q) clamped
             flat_idx = active_pmt.unsqueeze(-1) * n_bins + bin_idx   # (M, Q) flat index into output
-            weights = active_counts.unsqueeze(-1) * du.unsqueeze(0) * in_window  # (M, Q) weighted counts
-            out_flat.scatter_add_(0, flat_idx.reshape(-1), weights.reshape(-1))  # accumulate
+            out_flat.scatter_add_(0, flat_idx.reshape(-1), (counts_q * in_window).float().reshape(-1))  # accumulate
 
-        #return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)
-        return out_flat.reshape(n_pmts_full, n_bins).to(torch.float32)  # (2P, n_bins)
+        return out_flat.reshape(n_pmts_full, n_bins).to(torch.int32)  # (2P, n_bins)
         
     def _sample_raw(self, pos, scale, N, P, n_pmts_full, chunk_size, t_step):
         """Inverse-CDF sampling for raw (time, channel, source_idx) triples.
@@ -316,6 +318,7 @@ class PCATOFSampler(TOFSamplerBase):
         all_ch = []
         all_source = []
         u_grid = self.u_grid  # (Q,) uniform quantile grid
+        du = self._du        # (Q,) probability weight per quantile bin
 
         for start in range(0, N, chunk_size):
             end = min(start + chunk_size, N)
@@ -331,51 +334,55 @@ class PCATOFSampler(TOFSamplerBase):
             v, t0, coeffs = self._lookup(pos_lookup)  # (C,P), (C,P), (C,P,K)
 
             expected = (v * chunk_scale.unsqueeze(1) * self._pmt_qe).clamp_(min=0)  # (C, P)
-            counts = torch.poisson(expected).long()  # (C, P) integer photon counts
-            active_mask = counts > 0                 # (C, P) bool
 
-            n_active = active_mask.sum().item()      # M = number of active pairs
-            if n_active == 0:
+            counts_q = torch.poisson(expected.unsqueeze(-1) * du)  # (C, P, Q)
+            has_photon = counts_q.sum(-1) > 0                       # (C, P)
+            if not has_photon.any():
                 continue
 
-            active_counts = counts[active_mask]      # (M,)
-            active_coeffs = coeffs[active_mask]      # (M, K)
-            active_t0 = t0[active_mask]              # (M,)
+            counts_q      = counts_q[has_photon]      # (M', Q)
+            active_coeffs = coeffs[has_photon]         # (M', K)
+            active_t0     = t0[has_photon]             # (M',)
+            n_active      = counts_q.shape[0]          # M'
 
             # Track which input position each active pair belongs to
-            pos_local, _ = active_mask.nonzero(as_tuple=True)  # (M,) position index within chunk
+            pos_local, _ = has_photon.nonzero(as_tuple=True)  # (M',) position index within chunk
 
             # assign full-detector PMT channel ids (0..2P-1)
             pmt_offset = torch.where(on_pos_side, P, 0).unsqueeze(1).expand(C, P)  # (C, P)
             pmt_base = torch.arange(P, device=self._device).unsqueeze(0).expand(C, -1)  # (C, P)
-            active_pmt = (pmt_base + pmt_offset)[active_mask]  # (M,) channel ids in [0, 2P)
+            active_pmt = (pmt_base + pmt_offset)[has_photon]         # (M',)
 
-            q_abs = self._quantile_times(active_coeffs, active_t0)  # (M, Q) absolute quantile times
+            q_abs = self._quantile_times(active_coeffs, active_t0)   # (M', Q)
 
-            # expand each active pair by its photon count
-            total_photons = active_counts.sum().item()  # T = total photons in this chunk
-            pair_idx = torch.repeat_interleave(
-                torch.arange(n_active, device=self._device), active_counts
-            )  # (T,) which active pair each photon belongs to
+            # expand each active pair by its total photon count
+            Q = u_grid.shape[0]
+            counts_flat = counts_q.long().reshape(-1) #(T,)
+            total_photons = int(counts_flat.sum().item()) # T
 
-            # inverse-CDF: draw uniform, interpolate into quantile function
-            u = torch.rand(total_photons, device=self._device)  # (T,) ~ U(0,1)
+            #for each photon, find which (pair, tbin) slot
+            slot_idx = torch.repeat_interleave(
+                torch.arange(n_active*Q, device=self._device), counts_flat
+            )
+            m_idx = slot_idx // Q # (T,), which pair each photon belongs to
+            q_idx = slot_idx % Q # (T,), which tbin each photon belongs to
 
-            idx = torch.searchsorted(u_grid, u).clamp(1, u_grid.shape[0] - 1)  # (T,) right bin edge
-            u_lo, u_hi = u_grid[idx - 1], u_grid[idx]      # (T,) bracketing u-grid values
-            t_lo = q_abs[pair_idx, idx - 1]                 # (T,) quantile time at left edge
-            t_hi = q_abs[pair_idx, idx]                     # (T,) quantile time at right edge
-            frac = ((u - u_lo) / (u_hi - u_lo + 1e-12)).clamp_(0, 1)  # (T,) interpolation weight
-            t_samp = t_lo + frac * (t_hi - t_lo)           # (T,) sampled arrival times
+            # inverse-CDF: draw uniform in each quantile bin for t_stamp
+            u = torch.rand(total_photons, device=self._device)        # (T,) ~ U(0,1)
+            t_lo = torch.where(q_idx > 0,
+                    q_abs[m_idx, (q_idx - 1).clamp(0)],
+                    torch.zeros(total_photons, device=self._device))  # (T,) quantile time at left edge
+            t_hi = q_abs[m_idx, q_idx]                         # (T,) quantile time at right edge
+            t_samp = t_lo + u * (t_hi - t_lo)           # (T,) sampled arrival times
 
             if chunk_t is not None:
                 t_expanded = chunk_t.unsqueeze(1).expand(C, P)  # (C, P)
-                active_t_emit = t_expanded[active_mask]         # (M,)
-                t_samp = t_samp + active_t_emit[pair_idx]       # (T,) add emission time offset
+                active_t_emit = t_expanded[has_photon]         # (M,)
+                t_samp = t_samp + active_t_emit[m_idx]         # (T,) add emission time offset
 
             all_times.append(t_samp)                         # (T,)
-            all_ch.append(active_pmt[pair_idx])              # (T,) PMT channel per photon
-            all_source.append(pos_local[pair_idx] + start)   # (T,) global position index per photon
+            all_ch.append(active_pmt[m_idx])                 # (T,) PMT channel per photon
+            all_source.append(pos_local[m_idx] + start)      # (T,) global position index per photon
 
         if len(all_times) > 0:
             return torch.cat(all_times), torch.cat(all_ch), torch.cat(all_source)
