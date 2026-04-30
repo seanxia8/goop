@@ -1546,6 +1546,7 @@ class TestLabeledMode:
         out = sim.simulate(pos, nph, tns, labels=lbl, stitched=True, subtract_t0=True)
         assert len(out) == 2
 
+    '''
     def test_return_tpc_with_pdgs_de(self):
         """`return_tpc=True` returns 7-tuple; pdg/de arrays survive when provided."""
         sim = self._sim()
@@ -1585,6 +1586,7 @@ class TestLabeledMode:
         _, _, _, _, _, pdg_o, de_o = out
         assert pdg_o is None
         assert de_o is None
+    '''
 
     def test_subtract_t0_per_label(self):
         """`subtract_t0=True` should normalise each label group independently
@@ -1672,6 +1674,6 @@ class TestProductionPipeline:
         # Simulate with the voxelized inputs (pdgs/de=None, like production).
         out = sim.simulate(
             pos_v, nph_v, tns_v, labels=lbl_v,
-            stitched=True, subtract_t0=True, return_tpc=False,
+            stitched=True, subtract_t0=False,
         )
         assert len(out) == 3
