@@ -161,6 +161,8 @@ def throw_in_time_window(
     if de is not None:
         de = _to_tensor(de, device)
 
+    # necessary to bring all point's t to positive
+    t_step = t_step - t_step.min()
     unique_labels = torch.unique(labels)
     mask = labels >= 0
     label_indices = torch.searchsorted(unique_labels, labels[mask])

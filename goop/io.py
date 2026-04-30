@@ -81,23 +81,30 @@ def _write_sliced_waveform(
     group.create_dataset("t0_ns", data=waveform.t0_ns.cpu().numpy().astype(np.float32), compression="gzip")
     group.create_dataset("pmt_id", data=waveform.pmt_id.cpu().numpy().astype(np.int32), compression="gzip")
 
+def _to_numpy(x) -> np.ndarray:
+    """Convert a PyTorch tensor or array-like to a numpy array."""
+    import torch as _torch
+    if isinstance(x, _torch.Tensor):
+        return x.detach().cpu().numpy()
+    return np.asarray(x)
+
 def _write_tpc_data(
     group: h5py.Group,
-    positions: np.ndarray,
-    n_photons: np.ndarray,
-    t_step: np.ndarray,
+    positions,
+    n_photons,
+    t_step,
     label_val: int,
-    de: np.ndarray = None,
-    pdg: np.ndarray = None,
+    de=None,
+    pdg=None,
 ) -> None:
-    group.create_dataset("tpc_positions", data=positions.astype(np.float32), compression="gzip")
-    group.create_dataset("tpc_n_photons", data=n_photons.astype(np.int32), compression="gzip")
-    group.create_dataset("tpc_t_step", data=t_step.astype(np.float32), compression="gzip")
+    group.create_dataset("tpc_positions", data=_to_numpy(positions).astype(np.float32), compression="gzip")
+    group.create_dataset("tpc_n_photons", data=_to_numpy(n_photons).astype(np.int32), compression="gzip")
+    group.create_dataset("tpc_t_step", data=_to_numpy(t_step).astype(np.float32), compression="gzip")
     group.create_dataset("tpc_labels", data=np.array([label_val], dtype=np.int32), compression="gzip")
     if de is not None:
-        group.create_dataset("tpc_de", data=de.astype(np.float32), compression="gzip")
+        group.create_dataset("tpc_de", data=_to_numpy(de).astype(np.float32), compression="gzip")
     if pdg is not None:
-        group.create_dataset("tpc_pdg", data=pdg.astype(np.int32), compression="gzip")
+        group.create_dataset("tpc_pdg", data=_to_numpy(pdg).astype(np.int32), compression="gzip")
 
 def save_event_light_w_tpc(
     f: h5py.File,

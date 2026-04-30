@@ -547,7 +547,7 @@ def main():
                         # path after voxelization since voxels merge segments
                         # with potentially different pdgs. The raw_* snapshots
                         # above keep the unmerged truth for saving.
-                        pdgs, des = None, None
+                        pdgs_vox, des_vox = None, None
                         t_vox = time.time() - tv0
                         n_after = pos_mm_vox.shape[0]
                     # Re-anchor t0 so t_goop_elapsed measures only goop_sim.simulate.
@@ -574,7 +574,7 @@ def main():
                     t0 = time.time()
                     waveforms_cpu = waveforms_to_cpu(waveforms)
                     item = (event_key, waveforms_cpu, evt_idx,
-                            raw_pos, raw_nph, raw_tns, raw_lbl, raw_des, raw_pdg)
+                            pos_mm, n_ph, t_ns, labels, des, pdgs)
 
                     if num_workers > 0:
                         save_queue.put(item)
